@@ -51,7 +51,7 @@ Hosted configuration uses three Actions secrets:
 
 | Secret | Purpose |
 |---|---|
-| `MERCOR_API_KEY` | Dedicated source connection, restricted to the five tools below |
+| `MERCOR_API_KEY` (currently supplied by `UNIFIED_091826`) | Dedicated source connection, restricted to the five tools below |
 | `DG_HUB_ACCESS_KEY` | Existing dashboard reader key, so the app's unlock key stays the same |
 | `DG_HUB_STATE_KEY` | Separate 32-byte base64url key protecting complete collector caches |
 

@@ -30,7 +30,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       DG_HUB_ACCESS_KEY: ${{ secrets.DG_HUB_ACCESS_KEY }}
       DG_HUB_STATE_KEY: ${{ secrets.DG_HUB_STATE_KEY }}
-      MERCOR_API_KEY: ${{ secrets.MERCOR_API_KEY }}
+      MERCOR_API_KEY: ${{ secrets.MERCOR_API_KEY || secrets.UNIFIED_091826 }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out trusted source
