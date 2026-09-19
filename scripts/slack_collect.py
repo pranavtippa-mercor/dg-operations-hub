@@ -411,6 +411,8 @@ def referenced_tasks(message, tasks):
 
 def collect(config, client=None, *, only=None, limit=None, now=None):
     from source_client import SourceClient
+    from runtime_config import normalize_config
+    config = normalize_config(config, root=ROOT)
     settings = config['slack']
     cache = Path(settings['cache_dir'])
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -700,7 +702,8 @@ def main():
     parser.add_argument('--only', action='append', help='Bounded test scope; never advances whole-scope freshness')
     parser.add_argument('--limit', type=int, help='Bounded test scope; never advances whole-scope freshness')
     args = parser.parse_args()
-    result = collect(load(args.config), only=args.only, limit=args.limit)
+    from runtime_config import load_config
+    result = collect(load_config(args.config), only=args.only, limit=args.limit)
     print(json.dumps(result))
     return 0 if result['ok'] or result['partial_selection'] and not result['errors'] else 2
 

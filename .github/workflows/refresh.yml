@@ -1,0 +1,87 @@
+name: Refresh encrypted operations data
+
+on:
+  schedule:
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      refresh_all:
+        description: Refresh every source for a complete cutover check
+        type: boolean
+        default: false
+      verify_state_only:
+        description: Verify restored state and encryption without source calls or publication
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: operations-data-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.DG_HUB_HOSTED_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DG_HUB_ACCESS_KEY: ${{ secrets.DG_HUB_ACCESS_KEY }}
+      DG_HUB_STATE_KEY: ${{ secrets.DG_HUB_STATE_KEY }}
+      MERCOR_API_KEY: ${{ secrets.MERCOR_API_KEY }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Check required connections
+        env:
+          VERIFY_STATE_ONLY: ${{ inputs.verify_state_only == true && 'true' || 'false' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          required = ['DG_HUB_ACCESS_KEY', 'DG_HUB_STATE_KEY']
+          if os.environ.get('VERIFY_STATE_ONLY') != 'true':
+              required.append('MERCOR_API_KEY')
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit('Missing GitHub Actions secrets: ' + ', '.join(missing))
+          print('Hosted credentials are configured.')
+          PY
+      - name: Restore encrypted collector state
+        id: restore
+        run: python3 scripts/hosted_state.py restore
+      - name: Collect and publish encrypted dashboard
+        id: collect
+        if: inputs.verify_state_only != true
+        env:
+          REFRESH_ALL: ${{ inputs.refresh_all == true && 'true' || 'false' }}
+          PUBLISH_ENABLED: ${{ vars.DG_HUB_HOSTED_ENABLED }}
+        run: |
+          args=(--hosted --due-only)
+          if [ "$REFRESH_ALL" = "true" ]; then
+            args+=(--refresh-all)
+          fi
+          if [ "$PUBLISH_ENABLED" = "true" ]; then
+            args+=(--push)
+          fi
+          python3 scripts/publish.py "${args[@]}"
+      - name: Verify restored snapshot without source access
+        if: inputs.verify_state_only == true
+        run: python3 scripts/publish.py --hosted --cached
+      - name: Verify dashboard decryption
+        if: success()
+        run: node --experimental-strip-types scripts/verify_private.mts
+      - name: Save encrypted collector progress
+        if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true
+        run: python3 scripts/hosted_state.py save
+      - name: Clear private runner files
+        if: always()
+        run: rm -rf -- .private

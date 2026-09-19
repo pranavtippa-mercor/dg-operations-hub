@@ -3,6 +3,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 
 spec = importlib.util.spec_from_file_location('collector_schedule', Path(__file__).resolve().parents[1]/'scripts/collector_schedule.py')
 scheduler = importlib.util.module_from_spec(spec)
@@ -10,6 +13,49 @@ spec.loader.exec_module(scheduler)
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_finite_run_only_waits_for_due_sources_and_persists_cadence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'status.json'
+            path.write_text(json.dumps({'modules':{'ok':True,'next_at':2000,'last_success_at':'prior'}}))
+            calls=[]
+            def run(name,config):
+                calls.append(name)
+                return {'ok':True}
+            first=scheduler.CollectorScheduler({},runner=run,clock=lambda:1000,status_path=path)
+            try:
+                result=first.run_due()
+                self.assertEqual(result,{'ok':True,'attempted':['slack'],'failed':[],'changed':True})
+                self.assertEqual(first.futures,{})
+                self.assertEqual(first.status['modules']['last_success_at'],'prior')
+            finally:
+                first.close()
+            second=scheduler.CollectorScheduler({},runner=run,clock=lambda:1001,status_path=path)
+            try:
+                self.assertEqual(second.run_due()['attempted'],[])
+                self.assertEqual(calls,['slack'])
+                second.run_due(force=True)
+                self.assertEqual(calls.count('modules'),1)
+                self.assertEqual(calls.count('slack'),2)
+            finally:
+                second.close()
+
+    def test_partial_receipt_is_preserved_without_advancing_success(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'status.json'
+            path.write_text(json.dumps({'slack':{'ok':True,'last_success_at':'prior','receipt':{'ok':True}}}))
+            partial={'ok':False,'errors':2,'threads_complete':3,'missing_roots':1}
+            s=scheduler.CollectorScheduler({},runner=lambda name,config:partial if name=='slack' else {'ok':True},clock=lambda:1000,status_path=path)
+            try:
+                result=s.run_due()
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['failed'],['slack'])
+                self.assertEqual(s.status['slack']['last_attempt_receipt'],partial)
+                self.assertEqual(s.status['slack']['last_success_at'],'prior')
+                self.assertEqual(s.status['slack']['receipt'],{'ok':True})
+                self.assertEqual(s.status['slack']['next_at'],1300)
+            finally:
+                s.close()
+
     def test_separate_cadences_and_no_overlap(self):
         with tempfile.TemporaryDirectory() as folder:
             now, calls = [1000], []

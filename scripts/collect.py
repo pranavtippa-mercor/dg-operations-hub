@@ -10,6 +10,7 @@ UTC = timezone.utc
 PT = ZoneInfo('America/Los_Angeles')
 sys.path.insert(0, str(ROOT / 'scripts'))
 from source_client import SourceClient
+from runtime_config import load_config, normalize_config
 
 def load(path): return json.loads(Path(path).read_text())
 def iso(dt): return dt.astimezone(UTC).isoformat().replace('+00:00', 'Z')
@@ -42,6 +43,7 @@ def validate_modules(doc):
             if row['t']!=[sum(row[k]) for k in keys]: raise ValueError('Module totals do not reconcile')
 
 def collect(config, live=False):
+    config = normalize_config(config, root=ROOT)
     if config.get('version') != 2:
         raise ValueError('Migrate sources to the independent version 2 configuration first.')
     state = load(config['task_state'])
@@ -155,7 +157,7 @@ def collect(config, live=False):
       'confirmations':{'at':slack_status.get('collected_at') or confirmation_at,'cadence_minutes':15,'label':'Slack confirmations checked'+slack_scope},
       'slack':{'at':slack_status.get('collected_at') or max((s.get('seen_at') or s.get('at') for s in slack.values()),default=None),'cadence_minutes':15,'label':'Slack activity'+slack_scope},
       'modules':{'at':modules.get('snapshot_at_utc') or modules['generated_at_utc'],'cadence_minutes':60,'label':'Module failure aggregates'}},
-      'history':history,'conflicts':conflicts,'mode':'Independent collectors'}
+      'history':history,'conflicts':conflicts,'mode':config['runtime_mode']}
 
 def atomic_write(path,doc):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
@@ -163,7 +165,7 @@ def atomic_write(path,doc):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',default=str(ROOT/'.private/config.json'));parser.add_argument('--live',action='store_true');parser.add_argument('--out',default=str(ROOT/'.private/snapshot.json'))
-    args=parser.parse_args();doc=collect(load(args.config),args.live)
+    args=parser.parse_args();doc=collect(load_config(args.config),args.live)
     pending=Path(args.out).with_name('pending-snapshot.json')
     atomic_write(pending,doc)
     try:

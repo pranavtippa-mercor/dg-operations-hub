@@ -1,6 +1,7 @@
-"""Read-only source calls through the user's existing authenticated Codex connection."""
+"""Read-only source calls through local Codex or the hosted Mercor REST gateway."""
 import json
 import fcntl
+import os
 import re
 import sys
 from pathlib import Path
@@ -37,6 +38,21 @@ def decode_response(raw):
     if texts:
         return '\n'.join(texts)
     raise RuntimeError('Source returned no readable evidence.')
+
+
+def decode_rest_response(raw):
+    """Preserve native REST values; decode only an identifiable MCP tool result."""
+    from remote_source import reject_reported_error
+    reject_reported_error(raw)
+    if isinstance(raw, dict):
+        content = raw.get('content')
+        content_types = {'text', 'image', 'audio', 'resource', 'resource_link'}
+        is_tool_result = (isinstance(content, list) and all(
+            isinstance(part, dict) and part.get('type') in content_types for part in content)
+            and set(raw) <= {'content', 'structuredContent', 'isError', '_meta'})
+        if is_tool_result:
+            return reject_reported_error(decode_response(raw))
+    return raw
 
 
 def validate_call(tool, args):
@@ -76,6 +92,11 @@ class SourceClient:
             return self._call(tool_name, arguments)
 
     def _call(self, tool_name, arguments):
+        if self.config.get('source_transport') == 'https' or os.environ.get('GITHUB_ACTIONS') == 'true':
+            if self.bridge is None:
+                from remote_source import RemoteSource
+                self.bridge = RemoteSource(timeout=self.timeout)
+            return decode_rest_response(self.bridge.call_tool(tool_name, arguments))
         if self.bridge is None:
             adapter = Path(self.config.get('bridge_dir', str(Path.home() / 'Documents/Ryu/Tools')))
             sys.path.insert(0, str(adapter))
