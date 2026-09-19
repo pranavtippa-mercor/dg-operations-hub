@@ -41,8 +41,16 @@ def decode_response(raw):
 
 
 def decode_rest_response(raw):
-    """Preserve native REST values; decode only an identifiable MCP tool result."""
+    """Decode serialized objects/lists and MCP results; preserve other REST values."""
     from remote_source import reject_reported_error
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            pass
+        else:
+            if isinstance(parsed, (dict, list)):
+                raw = parsed
     reject_reported_error(raw)
     if isinstance(raw, dict):
         content = raw.get('content')
