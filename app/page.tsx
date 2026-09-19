@@ -927,7 +927,7 @@ export default function Home() {
                 All times Pacific ·{" "}
                 {view === "staleness"
                   ? "Update timestamps are activity proxies, not proof of meaningful work."
-                  : `Slack confirmations harvested ${dateLabel(data.sources.confirmations?.at)}.`}
+                  : `Slack evidence checked ${dateLabel(data.sources.confirmations?.at)}. Coverage is shown in Data & refresh.`}
               </span>
             </div>
             <div className="table-scroll">
@@ -1569,8 +1569,8 @@ export default function Home() {
               Snapshot assembled {dateLabel(data.generated_at, true)} ·{" "}
               {data.mode}. The module window ends{" "}
               {data.modules.window_end_local} Pacific. Slack confirmation
-              classifications are inherited from a keyword-based harvest; read
-              the actual reply before relying on a commitment.
+              classifications include automated interpretations; open the source
+              reply before relying on a commitment.
             </p>
             <h3>How the signals work</h3>
             <ul>
@@ -1757,6 +1757,16 @@ export default function Home() {
             />
             {task.confirmation && (
               <div className="evidence">
+                {task.confirmation.thread_gap && (
+                  <p className="notice">{task.confirmation.thread_gap}</p>
+                )}
+                {task.confirmation.observed_at && (
+                  <p className="small">
+                    Full thread read {dateLabel(task.confirmation.observed_at, true)}
+                    {task.confirmation.checked_at &&
+                      ` · Changes checked ${dateLabel(task.confirmation.checked_at, true)}`}
+                  </p>
+                )}
                 <p>
                   Asked {dateLabel(task.confirmation.asked, true)} by{" "}
                   {task.confirmation.asked_by || "unknown"}.<br />

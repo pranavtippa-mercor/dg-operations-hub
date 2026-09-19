@@ -22,35 +22,40 @@ The unencrypted snapshot, configuration and scan history live in ignored `.priva
 ## Source flow
 
 ```text
-One read-only Studio inventory + current world definitions
-    + cached Slack confirmations / activity / deadline evidence
-    + existing hourly module aggregates
+Studio inventory + current world definitions (5 minutes)
+Slack task threads, confirmations and explicit commitments (15 minutes)
+Datadog execution/verdict logs + Studio audit/world mapping (1 hour)
                  ↓
-Validated normalized snapshot → encrypted data → GitHub Pages
+Private source caches → validated snapshot → encrypted data → GitHub Pages
                  ↓
 Both task views and module health share one client state
 ```
 
-`python3 scripts/collect.py --live` uses the existing authorized local Codex/Mercor bridge. One SELECT supplies completion and activity fields, with current world definitions and owner lookup when necessary. It does not modify the old trackers. Fixed HTML roster coverage, previous unified IDs, status definitions, source world, and aggregate arithmetic must validate before the last good snapshot is replaced. Newly discarded tasks are present in the source query, then removed from displayed denominators. New source IDs cannot silently vanish on a later partial read.
+The app owns all three collectors. Legacy tracker directories are used only by the explicit one-time migration command. The running collectors use `.private/` and the existing authenticated Codex connection; no source credentials are copied into the application.
 
-The module data is the existing validated `module-failure-dashboard/data.json`, not its incomplete scratch TSVs. Its hourly source process remains necessary. Slack confirmations use `confirmations.json` directly; harvesting remains separate and the original dates stay visible. Confirmation classifications are inherited heuristic evidence, not verified promises.
+`python3 scripts/collect.py --live` performs one Studio inventory SELECT for completion and activity, refreshes world definitions, and resolves unknown owners. Fixed HTML roster coverage, previous unified IDs, status definitions, source world, and aggregate arithmetic must validate before the published snapshot is replaced. Newly discarded tasks are present in the source query, then removed from displayed denominators.
 
-`python3 scripts/publish.py --watch --push` refreshes task data and publishes compressed encrypted snapshots every five minutes while this Mac is awake and the process is running. `Start Operations Refresh.command` starts that resident process; Ctrl-C stops it. A process lock prevents duplicate publishers. It does not create cron, launchd, a broad research sweep, or cloud backups. Module refresh cadence remains one hour from its existing source. GitHub Pages itself only serves static files. Data refreshes replace the generated `dashboard-data` branch tip without rebuilding the app. That branch contains only the current encrypted snapshot and has no retained history; main source history is preserved. The publisher refuses to replace a branch with unrelated content. The browser checks for published updates every five minutes while visible; it does not talk directly to Studio or Datadog.
+The Slack collector combines scoped thread reads with incremental task-reference discovery. After its initial baseline, complete channel searches identify changed threads; unchanged verified threads are reused, with a daily full-thread check. Evidence retains the original author, message time and link. Only attributable, explicit dates become deadline commitments; ambiguous replies remain visible evidence. A confirmation classification is a heuristic, not an independently verified promise. Source dates and coverage remain separate from task status.
 
-A failed refresh retains the last published snapshot. The client rejects source-date regression, separates imported/published modes, and shows stale-source warnings. A manual import disables feed polling until reconnected. Cached imports label activity timing unknown because old renderer timestamps do not establish Studio read times.
+The module collector queries Datadog directly, joins audit identities to Studio's production world, and builds the execution/dimension aggregates deterministically. Private caches avoid repeating unchanged historical work. No language-model turn or legacy artifact publication is needed to refresh metrics.
+
+`python3 scripts/service.py start` starts one detached coordinator. `Start Operations Refresh.command` does the same; the terminal may be closed. It schedules independent collectors, prevents duplicate publishers and overlapping source jobs, serializes connector calls across workers, retries failed collectors after five minutes, and retains their last successful evidence. `python3 scripts/service.py status` checks the exact updater process; `stop` requests its shutdown. After a reboot or logout, start it again. This Mac must remain awake and signed in with working Codex and GitHub connections. GitHub Pages serves the static app; collection runs locally.
+
+For a deliberate full source verification, `python3 scripts/collector_schedule.py` refreshes the Slack and module sources once. `python3 scripts/publish.py --refresh-all --push` refreshes all sources and publishes, and must run while the resident coordinator is stopped. Routine source failures keep their original freshness timestamps. Collection never sends Slack messages or changes Studio records.
+
+Data refreshes replace the generated `dashboard-data` branch tip without rebuilding the app. That branch contains only the current encrypted snapshot and has no retained history; main source history is preserved. The publisher refuses to replace a branch with unrelated content. The browser checks for published updates every five minutes while visible. It rejects source-date regression and separates imported/published modes; manual import disables feed polling until reconnected.
 
 ## Local setup
 
-Requires Node 22+, Python 3.9+ with zoneinfo, macOS Keychain for publishing, GitHub CLI authentication, and the existing local source adapters.
+Requires Node 22+, Python 3.9+ with zoneinfo, macOS Keychain, GitHub CLI authentication, and the existing local Codex/Mercor bridge in `Documents/Ryu/Tools` (override `bridge_dir` in private configuration if needed).
 
-Create `.private/config.json` (never commit it):
+Run `scripts/migrate_sources.py` once with the three existing tracker directories. It imports roster metadata, historical evidence and bootstrap caches into `.private/`, without replacing existing unified state. Review its `.private/config-v2.json`, then activate it as `.private/config.json`. Never commit either file. Version 2 configuration contains only source scope, private cache paths and collector intervals; it has no recurring dependency on legacy tracker paths.
 
-```json
-{
-  "completion": "/path/to/html-ee-tracker/artifact",
-  "staleness": "/path/to/dg-staleness",
-  "modules": "/path/to/module-failure-dashboard/data.json"
-}
+```sh
+python3 scripts/migrate_sources.py \
+  --completion /path/to/html-ee-tracker/artifact \
+  --staleness /path/to/dg-staleness \
+  --modules /path/to/module-failure-dashboard
 ```
 
 ```sh

@@ -20,6 +20,9 @@ export type Confirmation = {
   reply_by?: string;
   reply_text?: string;
   reply_url?: string;
+  observed_at?: string;
+  checked_at?: string;
+  thread_gap?: string;
 };
 export type Task = {
   id: string;
