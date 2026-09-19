@@ -13,6 +13,10 @@ on:
         description: Verify restored state and encryption without source calls or publication
         type: boolean
         default: false
+      probe_studio_only:
+        description: Inspect Studio response structure without source contents or publication
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -58,9 +62,12 @@ jobs:
       - name: Restore encrypted collector state
         id: restore
         run: python3 scripts/hosted_state.py restore
+      - name: Inspect Studio response structure
+        if: inputs.probe_studio_only == true
+        run: python3 scripts/probe_studio.py
       - name: Collect and publish encrypted dashboard
         id: collect
-        if: inputs.verify_state_only != true
+        if: inputs.verify_state_only != true && inputs.probe_studio_only != true
         env:
           REFRESH_ALL: ${{ inputs.refresh_all == true && 'true' || 'false' }}
           PUBLISH_ENABLED: ${{ vars.DG_HUB_HOSTED_ENABLED }}
@@ -74,13 +81,13 @@ jobs:
           fi
           python3 scripts/publish.py "${args[@]}"
       - name: Verify restored snapshot without source access
-        if: inputs.verify_state_only == true
+        if: inputs.verify_state_only == true && inputs.probe_studio_only != true
         run: python3 scripts/publish.py --hosted --cached
       - name: Verify dashboard decryption
-        if: success()
+        if: success() && inputs.probe_studio_only != true
         run: node --experimental-strip-types scripts/verify_private.mts
       - name: Save encrypted collector progress
-        if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true
+        if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true && inputs.probe_studio_only != true
         run: python3 scripts/hosted_state.py save
       - name: Clear private runner files
         if: always()
