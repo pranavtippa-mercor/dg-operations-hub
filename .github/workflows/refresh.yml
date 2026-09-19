@@ -87,7 +87,7 @@ jobs:
         if: success() && inputs.probe_studio_only != true
         run: node --experimental-strip-types scripts/verify_private.mts
       - name: Save encrypted collector progress
-        if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true && inputs.probe_studio_only != true
+        if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true
         run: python3 scripts/hosted_state.py save
       - name: Clear private runner files
         if: always()

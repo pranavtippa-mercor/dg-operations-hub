@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Hosted-only, one-read Studio response-shape probe; never prints source values."""
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import tempfile
 import traceback
 from unittest.mock import patch
 
@@ -15,12 +17,56 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_DEPTH = 4
 MAX_NODES = 60
 MAX_STRING_SCAN = 1024 * 1024
+MAX_CAPTURE_BYTES = 64 * 1024
+DIAGNOSTIC_PATH = ROOT / '.private/diagnostics/studio-probe.json'
+SECRET_ENV_NAMES = ('MERCOR_API_KEY', 'DG_HUB_ACCESS_KEY', 'DG_HUB_STATE_KEY',
+                    'GH_TOKEN', 'GITHUB_TOKEN')
 KNOWN_KEYS = frozenset({
     'content', 'structuredContent', 'toolResult', 'result', 'data', 'response',
     'body', 'payload', 'rows', 'columns', 'text', 'json', 'isError', 'error',
     'errors', 'ok', 'success', 'status', 'status_code', 'metadata', '_meta',
     '_mercor_rid', 'pagination', 'pagination_info', 'next_cursor',
 })
+
+
+def capture_private_result(raw):
+    """Write only a bounded, credential-redacted source result and UTC timestamp."""
+    result = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, separators=(',', ':'))
+    secrets = {os.environ[name] for name in SECRET_ENV_NAMES if os.environ.get(name)}
+    # Object results contain JSON escapes; cover these as well as literal values.
+    variants = secrets | {json.dumps(secret, ensure_ascii=ascii_only)[1:-1]
+                          for secret in secrets for ascii_only in (False, True)}
+    for secret in sorted(variants, key=len, reverse=True):
+        result = result.replace(secret, '[REDACTED]')
+    at = datetime.now(timezone.utc).isoformat()
+
+    def serialize(text):
+        return json.dumps({'result': text, 'datetime': at}, ensure_ascii=False,
+                          separators=(',', ':')).encode('utf-8')
+
+    # Redact before truncation, so a boundary cannot retain part of a credential.
+    prefix = result[:MAX_CAPTURE_BYTES]
+    truncated = len(result) > len(prefix)
+    data = serialize(prefix)
+    if truncated or len(data) > MAX_CAPTURE_BYTES:
+        lower, upper = 0, len(prefix)
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+            if len(serialize(prefix[:middle] + '\n[TRUNCATED]')) <= MAX_CAPTURE_BYTES:
+                lower = middle
+            else:
+                upper = middle - 1
+        data = serialize(prefix[:lower] + '\n[TRUNCATED]')
+    DIAGNOSTIC_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.studio-probe-', dir=DIAGNOSTIC_PATH.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(data)
+        os.replace(temporary, DIAGNOSTIC_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def value_type(value):
@@ -111,6 +157,7 @@ def probe(config, client_factory=None):
     decode = source_client.decode_rest_response
 
     def observe(raw):
+        capture_private_result(raw)
         report['transport_value_shape'] = shape(raw)
         return decode(raw)
 

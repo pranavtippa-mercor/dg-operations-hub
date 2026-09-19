@@ -45,6 +45,7 @@ FIXED_PATHS = frozenset((
     'modules/bootstrap/spec_map.json', 'modules/bootstrap/studio_audit_registry.tsv',
     'slack/roots.json', 'slack/state.json', 'slack/activity.json', 'slack/commitments.json',
     'slack/confirmations.json', 'slack/bundle.json',
+    'diagnostics/studio-probe.json',
 ))
 DYNAMIC_DIRS = frozenset(('modules/dimensions', 'slack/threads', 'slack/history'))
 SCOPE_HEADERS = frozenset(('X-Campaign-Id', 'X-Company-Id', 'X-Account-Id'))

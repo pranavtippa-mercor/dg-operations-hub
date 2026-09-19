@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,14 @@ import source_client
 
 
 class ProbeStudioTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.diagnostic_path = Path(directory.name) / 'diagnostics/studio-probe.json'
+        path_patch = patch.object(P, 'DIAGNOSTIC_PATH', self.diagnostic_path)
+        path_patch.start()
+        self.addCleanup(path_patch.stop)
+
     def test_shapes_never_emit_source_values_or_unknown_keys(self):
         private = 'private-provider-record-marker'
         value = {'response': json.dumps({'rows': [{'task_id': private, private: 'secret'}]}), private: private}
@@ -67,6 +76,43 @@ class ProbeStudioTests(unittest.TestCase):
             report = P.probe({}, client_factory=lambda *a, **k: self.fail('No local source call allowed'))
         self.assertTrue(report['hosted_required'])
         self.assertEqual(report['source_calls'], 0)
+        self.assertFalse(self.diagnostic_path.exists())
+
+    def test_private_capture_redacts_all_credentials_without_public_raw_output(self):
+        secrets = {name: f'private-credential-{number}' for number, name in enumerate(P.SECRET_ENV_NAMES)}
+        raw = 'private-provider-detail ' + ' '.join(secrets.values())
+        class Client:
+            def __init__(self, *args, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def studio(self, *args): return source_client.decode_rest_response(raw)
+        with patch.dict(os.environ, dict(secrets, GITHUB_ACTIONS='true')):
+            report = P.probe({'studio': {'world': 'world_private'}}, client_factory=Client)
+        self.assertTrue(report['ok'])
+        saved_text = self.diagnostic_path.read_text()
+        saved = json.loads(saved_text)
+        self.assertEqual(set(saved), {'result', 'datetime'})
+        self.assertIn('private-provider-detail', saved['result'])
+        self.assertEqual(saved['result'].count('[REDACTED]'), len(secrets))
+        self.assertEqual(self.diagnostic_path.stat().st_mode & 0o777, 0o600)
+        public = json.dumps(report)
+        self.assertNotIn('private-provider-detail', public)
+        for secret in secrets.values():
+            self.assertNotIn(secret, saved_text)
+            self.assertNotIn(secret, public)
+        self.assertNotIn('world_private', saved_text)
+
+    def test_private_capture_is_byte_bounded_and_redacts_escaped_json_values(self):
+        secret = 'private-credential-\n"\u00e9'
+        with patch.dict(os.environ, {'MERCOR_API_KEY': secret, 'GITHUB_TOKEN': ''}):
+            P.capture_private_result({'result': secret + '\u00e9' * (P.MAX_CAPTURE_BYTES * 2)})
+        captured = self.diagnostic_path.read_bytes()
+        self.assertLessEqual(len(captured), P.MAX_CAPTURE_BYTES)
+        saved = json.loads(captured)
+        self.assertIn('[REDACTED]', saved['result'])
+        self.assertTrue(saved['result'].endswith('[TRUNCATED]'))
+        self.assertNotIn('private-credential-', saved['result'])
+        self.assertEqual(set(saved), {'result', 'datetime'})
 
     def test_errors_emit_frames_but_not_messages_or_source_lines(self):
         class Client:
