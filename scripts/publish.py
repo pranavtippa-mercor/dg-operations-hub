@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Refresh this dashboard and publish only an encrypted snapshot. No source mutations."""
-import argparse,hashlib,json,os,secrets,subprocess,sys,time
+import argparse,fcntl,hashlib,json,os,secrets,subprocess,sys,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 SERVICE='dg-operations-hub';ACCOUNT='pranavtippa-mercor';URL='https://pranavtippa-mercor.github.io/dg-operations-hub/'
@@ -49,8 +49,21 @@ def publish(key,live,commit,last_hash):
     print('Encrypted snapshot ready.' if not commit else 'Encrypted snapshot published.',flush=True)
     return digest
 
+def acquire_publisher_lock():
+    path=ROOT/'.private/publisher.lock'
+    path.parent.mkdir(parents=True,exist_ok=True)
+    handle=path.open('a+')
+    try:fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError('An operations publisher is already running.')
+    handle.seek(0);handle.truncate();handle.write(str(os.getpid()));handle.flush()
+    return handle
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--watch',action='store_true');p.add_argument('--cached',action='store_true');p.add_argument('--push',action='store_true');p.add_argument('--open',action='store_true');p.add_argument('--copy-key',action='store_true');a=p.parse_args()
+    # Hold the descriptor for this process; double-clicking the launcher cannot create duplicate publishers.
+    publisher_lock=None if a.open or a.copy_key else acquire_publisher_lock()
     key=access_key()
     if a.copy_key:
         run(['pbcopy'],input=key.encode());print('Access key copied to clipboard.');return
@@ -58,10 +71,11 @@ def main():
         run(['open',URL+'#key='+key],stdout=subprocess.DEVNULL);print('Opened the encrypted dashboard.');return
     digest=None
     while True:
+        started=time.monotonic()
         try:digest=publish(key,not a.cached,a.push,digest)
         except (subprocess.CalledProcessError,ValueError,OSError,RuntimeError) as e:
             print('Refresh failed; the last published data is retained. '+type(e).__name__,file=sys.stderr,flush=True)
             if not a.watch:return 1
         if not a.watch:return 0
-        time.sleep(300)
+        time.sleep(max(1,300-(time.monotonic()-started)))
 if __name__=='__main__':sys.exit(main())

@@ -35,7 +35,7 @@ Both task views and module health share one client state
 
 The module data is the existing validated `module-failure-dashboard/data.json`, not its incomplete scratch TSVs. Its hourly source process remains necessary. Slack confirmations use `confirmations.json` directly; harvesting remains separate and the original dates stay visible. Confirmation classifications are inherited heuristic evidence, not verified promises.
 
-`python3 scripts/publish.py --watch --push` refreshes task data and publishes compressed encrypted snapshots every five minutes while this Mac is awake and the process is running. `Start Operations Refresh.command` starts that resident process; Ctrl-C stops it. It does not create cron, launchd, a broad research sweep, or cloud backups. Module refresh cadence remains one hour from its existing source. GitHub Pages itself only serves static files. Data refreshes replace the generated `dashboard-data` branch tip without rebuilding the app. That branch contains only the current encrypted snapshot and has no retained history; main source history is preserved. The publisher refuses to replace a branch with unrelated content. The browser checks for published updates every five minutes while visible; it does not talk directly to Studio or Datadog.
+`python3 scripts/publish.py --watch --push` refreshes task data and publishes compressed encrypted snapshots every five minutes while this Mac is awake and the process is running. `Start Operations Refresh.command` starts that resident process; Ctrl-C stops it. A process lock prevents duplicate publishers. It does not create cron, launchd, a broad research sweep, or cloud backups. Module refresh cadence remains one hour from its existing source. GitHub Pages itself only serves static files. Data refreshes replace the generated `dashboard-data` branch tip without rebuilding the app. That branch contains only the current encrypted snapshot and has no retained history; main source history is preserved. The publisher refuses to replace a branch with unrelated content. The browser checks for published updates every five minutes while visible; it does not talk directly to Studio or Datadog.
 
 A failed refresh retains the last published snapshot. The client rejects source-date regression, separates imported/published modes, and shows stale-source warnings. A manual import disables feed polling until reconnected. Cached imports label activity timing unknown because old renderer timestamps do not establish Studio read times.
 
@@ -70,7 +70,7 @@ The local preview at `http://127.0.0.1:5189/dg-operations-hub/` loads the privat
 
 Target owner: `pranavtippa-mercor`; repository: `dg-operations-hub`.
 
-After GitHub authentication, create/link the repository, push `main`, and configure Pages to deploy through GitHub Actions. The included workflow tests and builds the static site, checks public output, then deploys it. App URL: `https://pranavtippa-mercor.github.io/dg-operations-hub/` (only live after successful publication).
+The repository is linked at https://github.com/pranavtippa-mercor/dg-operations-hub, with Pages configured to deploy through GitHub Actions. Push source changes to `main`. The included workflow tests and builds the static site, checks public output, then deploys it. App URL: `https://pranavtippa-mercor.github.io/dg-operations-hub/` (served by GitHub Pages).
 
 `python3 scripts/publish.py` prepares an encrypted snapshot. Add `--push` after the repository exists. No source credentials or decryption keys are needed in GitHub Actions.
 
