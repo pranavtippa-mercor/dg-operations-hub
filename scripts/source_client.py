@@ -86,6 +86,7 @@ class SourceClient:
             raise ValueError('Unexpected source tool.')
         self.timeout = timeout
         self.bridge = None
+        self.studio_bridge = None
 
     def call(self, tool_name, arguments):
         validate_call(tool_name, arguments)
@@ -101,6 +102,11 @@ class SourceClient:
 
     def _call(self, tool_name, arguments):
         if self.config.get('source_transport') == 'https' or os.environ.get('GITHUB_ACTIONS') == 'true':
+            if tool_name == 'studio':
+                if self.studio_bridge is None:
+                    from remote_studio import RemoteStudio
+                    self.studio_bridge = RemoteStudio(self.config, timeout=self.timeout)
+                return decode_rest_response(self.studio_bridge.call_tool(tool_name, arguments))
             if self.bridge is None:
                 from remote_source import RemoteSource
                 self.bridge = RemoteSource(timeout=self.timeout)
@@ -123,6 +129,9 @@ class SourceClient:
         })
 
     def close(self):
+        if self.studio_bridge is not None:
+            self.studio_bridge.close()
+            self.studio_bridge = None
         if self.bridge is not None:
             self.bridge.close()
             self.bridge = None

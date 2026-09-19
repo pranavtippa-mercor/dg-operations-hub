@@ -35,6 +35,7 @@ jobs:
       DG_HUB_ACCESS_KEY: ${{ secrets.DG_HUB_ACCESS_KEY }}
       DG_HUB_STATE_KEY: ${{ secrets.DG_HUB_STATE_KEY }}
       MERCOR_API_KEY: ${{ secrets.MERCOR_API_KEY || secrets.UNIFIED_091826 }}
+      STUDIO_API_KEY: ${{ secrets.STUDIO_API_KEY }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Check out trusted source
@@ -53,7 +54,7 @@ jobs:
           import os
           required = ['DG_HUB_ACCESS_KEY', 'DG_HUB_STATE_KEY']
           if os.environ.get('VERIFY_STATE_ONLY') != 'true':
-              required.append('MERCOR_API_KEY')
+              required.extend(['MERCOR_API_KEY', 'STUDIO_API_KEY'])
           missing = [name for name in required if not os.environ.get(name)]
           if missing:
               raise SystemExit('Missing GitHub Actions secrets: ' + ', '.join(missing))

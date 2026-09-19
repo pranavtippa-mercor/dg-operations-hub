@@ -9,7 +9,7 @@ import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from remote_source import BASE_URL, NoRedirects, RemoteSource, SourceHTTPError, SourceReportedError
+from remote_source import BASE_URL, NoRedirects, RemoteSource, SourceHTTPError, SourceReportedError, SourceAuthenticationError
 from source_client import SourceClient, decode_rest_response
 
 
@@ -85,15 +85,15 @@ class RemoteSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('remote_source.urllib.request.build_opener', return_value=opener):
             config = {'source_transport': 'https', 'source_lock': str(Path(directory)/'source.lock')}
             with SourceClient(config) as client:
-                self.assertEqual(client.call('studio', {'method': 'GET', 'path': '/tasks'}), native)
-                self.assertEqual(client.call('studio', {'method': 'GET', 'path': '/tasks'}), {'rows': [2]})
+                self.assertEqual(client.call('slack_read_thread', {}), native)
+                self.assertEqual(client.call('slack_read_thread', {}), {'rows': [2]})
         self.assertEqual(len(opener.requests), 2)
 
     def test_github_runner_never_falls_back_to_local_codex(self):
         opener = Opener([Response({'rows': []})])
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch('remote_source.urllib.request.build_opener', return_value=opener):
             with SourceClient({'source_lock': str(Path(directory)/'source.lock'), 'bridge_dir': '/does-not-exist'}) as client:
-                self.assertEqual(client.call('studio', {'method': 'GET', 'path': '/tasks'}), {'rows': []})
+                self.assertEqual(client.call('slack_read_thread', {}), {'rows': []})
 
     def test_http_errors_and_connection_failures_are_sanitized(self):
         for status in (401, 403, 429, 500):
@@ -115,6 +115,14 @@ class RemoteSourceTests(unittest.TestCase):
             self.assertNotIn('private detail', str(raised.exception))
         self.assertEqual(RemoteSource(opener=Opener([Response({'error': None, 'rows': []})])).call_tool('studio', {}), {'error': None, 'rows': []})
 
+    def test_plain_auth_requirement_is_not_accepted_as_evidence(self):
+        for value in ('needs_auth: private provider detail', '  NEEDS_AUTH: private provider detail'):
+            with self.assertRaises(SourceAuthenticationError) as raised:
+                RemoteSource(opener=Opener([Response(value)])).call_tool('slack_read_thread', {})
+            self.assertNotIn('private provider detail', str(raised.exception))
+            with self.assertRaises(SourceAuthenticationError):
+                decode_rest_response(value)
+
     def test_redirects_and_manipulated_tool_paths_are_refused(self):
         for status in (301, 302, 303, 307, 308):
             with self.assertRaisesRegex(RuntimeError, 'redirect refused'):
@@ -133,7 +141,7 @@ class RemoteSourceTests(unittest.TestCase):
         with patch.dict(os.environ, {'MERCOR_API_KEY': ''}):
             with SourceClient({'source_transport': 'https', 'MERCOR_API_KEY': 'config-value-is-not-used'}) as client:
                 with self.assertRaises(RuntimeError):
-                    client._call('studio', {'method': 'GET'})
+                    client._call('slack_read_thread', {})
                 self.assertIsNone(client.bridge)
 
     def test_mutations_are_refused_before_transport_or_lock_creation(self):

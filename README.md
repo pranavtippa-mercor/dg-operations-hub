@@ -31,7 +31,7 @@ Private source caches → validated snapshot → encrypted data → GitHub Pages
 Both task views and module health share one client state
 ```
 
-The app owns all three collectors. Legacy tracker directories are used only by the explicit one-time migration command. Both local and hosted execution use the same collectors and private state. Local execution uses the authenticated Codex connection. Hosted execution uses a dedicated Mercor API key through Mercor's HTTPS tool gateway, with the same read-only restrictions. Source credentials never reach the website or generated Git branches.
+The app owns all three collectors. Legacy tracker directories are used only by the explicit one-time migration command. Both local and hosted execution use the same collectors and private state. Local execution uses the authenticated Codex connection. Hosted execution reads Studio directly with a dedicated campaign-scoped read-only Studio key; Slack and Datadog use a separate Mercor gateway key. Source credentials never reach the website or generated Git branches.
 
 `python3 scripts/collect.py --live` performs one Studio inventory SELECT for completion and activity, refreshes world definitions, and resolves unknown owners. Fixed HTML roster coverage, previous unified IDs, status definitions, source world, and aggregate arithmetic must validate before the published snapshot is replaced. Newly discarded tasks are present in the source query, then removed from displayed denominators.
 
@@ -45,31 +45,39 @@ The module collector queries Datadog directly, joins audit identities to Studio'
 
 The `Refresh encrypted operations data` workflow runs finite collection and publication jobs on GitHub's Linux runners. Once activated and verified, it needs no Mac, local Codex session, or open browser. The workflow is gated by the repository variable `DG_HUB_HOSTED_ENABLED=true`; manual runs remain available before activation. Local collection stays active until the cloud source connection and first complete hosted refresh have succeeded.
 
+**Current status, September 18:** the Mercor key is connected and hosted Slack/Datadog requests work. Studio's gateway tool rejects API-key callers because it requires forwarded Okta authentication. The direct Studio connection is implemented, but its separate `STUDIO_API_KEY` secret is still required. Hosted publication remains disabled and the Mac updater remains active pending a complete live check.
+
 The schedule requests a run every five minutes, offset from the start of the hour. A run refreshes task data and only the Slack/module collectors that are due. Persisted watermarks retain the 15-minute Slack and hourly module intervals. GitHub may delay or drop scheduled runs; these intervals are targets, not timing guarantees. Public-repository schedules can be disabled after 60 days without repository activity. See [GitHub's scheduled workflow documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule). Standard public-repository runners have [no Actions compute charge](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
 
-Hosted configuration uses three Actions secrets:
+Hosted configuration uses four Actions secrets:
 
 | Secret | Purpose |
 |---|---|
-| `MERCOR_API_KEY` (currently supplied by `UNIFIED_091826`) | Dedicated source connection, restricted to the five tools below |
+| `MERCOR_API_KEY` (currently supplied by `UNIFIED_091826`) | Slack and Datadog connection, restricted to the four tools below |
+| `STUDIO_API_KEY` | Native Studio key, restricted to **Project Doppelganger** and **Read-only** |
 | `DG_HUB_ACCESS_KEY` | Existing dashboard reader key, so the app's unlock key stays the same |
 | `DG_HUB_STATE_KEY` | Separate 32-byte base64url key protecting complete collector caches |
 
 Create the source key in [Team Platform API Keys](https://team.mercor.com/settings/integrations/api-keys), using a purpose name such as `coil-dg-operations` and these exact allowed tools:
 
 ```text
-studio
 slack_read_thread
 slack_search_public_and_private
 datadog_load_datadog_skill
 datadog_analyze_datadog_logs
 ```
 
-Save it directly as `MERCOR_API_KEY` in [repository Actions secrets](https://github.com/pranavtippa-mercor/dg-operations-hub/settings/secrets/actions). Never paste credentials into chat, source code, command arguments, or logs. The gateway uses `POST /tools/<tool_name>` with raw tool-schema JSON, as documented in Mercor's [API-key guide](https://github.com/Mercor-io/mercor-skills/blob/main/plugins/mercor-skills-team-agents/skills/mercor-coil-api-keys/SKILL.md). The `studio` proxy is additionally restricted by this application to GET requests and a single SELECT query. There are no Slack sends or Studio mutations. Source-key creation requires the account owner's UI access; Codex can configure the other secrets, migrate state, run verification, and activate the schedule programmatically under the user's authorization.
+Save it directly as `MERCOR_API_KEY` in [repository Actions secrets](https://github.com/pranavtippa-mercor/dg-operations-hub/settings/secrets/actions). The existing `UNIFIED_091826` secret is also accepted. The gateway uses `POST /tools/<tool_name>` with raw tool-schema JSON, as documented in Mercor's [API-key guide](https://github.com/Mercor-io/mercor-skills/blob/main/plugins/mercor-skills-team-agents/skills/mercor-coil-api-keys/SKILL.md). Enabling its `studio` tool does not supply Okta identity; hosted Studio reads use the separate native connection below.
+
+Create the native key at [Studio API Keys](https://studio.mercor.com/admin/api): **Create API Key → Specific projects → Project Doppelganger → Read-only**. Name it `dg-operations-hub-readonly` and choose an expiry; a scoped key may use **Never**. Save the generated value directly as `STUDIO_API_KEY` in the repository's Actions secrets. The current Studio proxy restricts key-management endpoints, so key creation requires this UI. Codex can complete the runner configuration, verification, and activation programmatically after the secret is present. [Studio's official setup guide](https://github.com/Mercor-io/mercor-skills/blob/main/plugins/mercor-skills-product-studio/skills/studio-api/references/setup.md) documents the native key and production API.
+
+Never paste credentials into chat, source code, command arguments, or logs. `scripts/remote_studio.py` sends the native key only to `https://api.studio.mercor.com`, refuses redirects, and permits only the collectors' GET endpoints and a single SELECT query. Source headers are limited to the configured campaign/company/account. There are no Slack sends or Studio mutations.
 
 The generated `collector-state` branch stores an encrypted manifest and encrypted file chunks. Unchanged chunks reuse existing Git blobs, avoiding repeated uploads of full Slack histories. The state key is separate from the dashboard key because collector caches include complete source threads. Only an explicit file allowlist is transferred; source credentials, Ryu notes, logs, locks, and process files are excluded. Restores validate authenticated ciphertext, file hashes, sizes, and paths. Plaintext exists only in the runner's private working directory and is removed at the end of the job. No plaintext Actions caches or artifacts are uploaded.
 
 The workflow runs only trusted `main` code, pins its setup actions, serializes runs, and uses GitHub's job-scoped token to publish within this repository. Successful source updates can publish even if another source fails; failed sources retain their previous freshness dates, and the workflow reports failure. State progress is saved after both successful and partial runs.
+
+The optional `probe_studio_only=true` manual run performs one existing Studio inventory read. Public logs contain bounded response-structure metadata only. A bounded, credential-redacted diagnostic is retained in encrypted collector state for private troubleshooting; it is never published as plaintext.
 
 For cutover, initialize the encrypted state, manually run the workflow with `refresh_all=true`, and verify all source dates plus the candidate snapshot's browser-compatible decryption. While `DG_HUB_HOSTED_ENABLED` is false, a manual run saves its candidate state without publishing to the live dashboard. A `verify_state_only=true` run can separately test Linux restoration and encryption without source credentials. After complete source verification, stop the local publisher and wait for its exit, enable `DG_HUB_HOSTED_ENABLED`, and dispatch a full hosted publication. Mark `.private/hosted-active.json` with `{"active":true}` after successful cutover so old desktop launchers cannot start a duplicate local publisher. These steps can be performed programmatically by Codex. If source authentication later expires or is revoked, replace the Actions secret and run a complete verification again; source-key lifetime is not assumed.
 
@@ -109,7 +117,7 @@ Target owner: `pranavtippa-mercor`; repository: `dg-operations-hub`.
 
 The repository is linked at https://github.com/pranavtippa-mercor/dg-operations-hub, with Pages configured to deploy through GitHub Actions. Push source changes to `main`. The included workflow tests and builds the static site, checks public output, then deploys it. App URL: `https://pranavtippa-mercor.github.io/dg-operations-hub/` (served by GitHub Pages).
 
-`python3 scripts/publish.py` prepares an encrypted snapshot. Add `--push` after the repository exists. The Pages build needs no source credentials or decryption keys. The separate data-refresh workflow uses the three secrets described above.
+`python3 scripts/publish.py` prepares an encrypted snapshot. Add `--push` after the repository exists. The Pages build needs no source credentials or decryption keys. The separate data-refresh workflow uses the four secrets described above.
 
 ## Definitions preserved and corrected
 

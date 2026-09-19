@@ -1,8 +1,11 @@
 import importlib.util
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 scripts = Path(__file__).resolve().parents[1]/'scripts'
 sys.path.insert(0, str(scripts))
@@ -12,6 +15,23 @@ spec.loader.exec_module(client)
 
 
 class SourceClientTests(unittest.TestCase):
+    def test_hosted_studio_and_other_sources_have_separate_credentials_and_transports(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), \
+                patch('remote_studio.RemoteStudio') as studio, patch('remote_source.RemoteSource') as gateway:
+            studio.return_value.call_tool.return_value = {'rows': [1]}
+            gateway.return_value.call_tool.return_value = 'thread'
+            config = {'source_lock': str(Path(directory)/'source.lock'), 'studio': {'headers': {}}}
+            with client.SourceClient(config) as source:
+                self.assertEqual(source.studio('POST', '/querier/unstructured', {'query': 'SELECT 1'}), {'rows': [1]})
+                self.assertEqual(source.call('slack_read_thread', {}), 'thread')
+                source.studio('GET', '/worlds/example')
+            studio.assert_called_once_with(config, timeout=180)
+            gateway.assert_called_once_with(timeout=180)
+            studio.return_value.close.assert_called_once_with()
+            gateway.return_value.close.assert_called_once_with()
+            self.assertEqual(studio.return_value.call_tool.call_count, 2)
+            self.assertEqual(gateway.return_value.call_tool.call_count, 1)
+
     def test_studio_mutations_and_multi_statement_queries_refused(self):
         for arguments in [
             {'method': 'PATCH', 'path': '/tasks/example'},

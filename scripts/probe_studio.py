@@ -19,7 +19,7 @@ MAX_NODES = 60
 MAX_STRING_SCAN = 1024 * 1024
 MAX_CAPTURE_BYTES = 64 * 1024
 DIAGNOSTIC_PATH = ROOT / '.private/diagnostics/studio-probe.json'
-SECRET_ENV_NAMES = ('MERCOR_API_KEY', 'DG_HUB_ACCESS_KEY', 'DG_HUB_STATE_KEY',
+SECRET_ENV_NAMES = ('MERCOR_API_KEY', 'STUDIO_API_KEY', 'DG_HUB_ACCESS_KEY', 'DG_HUB_STATE_KEY',
                     'GH_TOKEN', 'GITHUB_TOKEN')
 KNOWN_KEYS = frozenset({
     'content', 'structuredContent', 'toolResult', 'result', 'data', 'response',

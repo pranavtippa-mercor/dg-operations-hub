@@ -26,12 +26,18 @@ class SourceReportedError(RuntimeError):
     """The source reported failure; its private error text is intentionally omitted."""
 
 
+class SourceAuthenticationError(SourceReportedError):
+    """The upstream requires a different or renewed authenticated connection."""
+
+
 class NoRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise RuntimeError('Source redirect refused; credentials were not forwarded.')
 
 
 def reject_reported_error(value):
+    if isinstance(value, str) and value.lstrip().lower().startswith('needs_auth:'):
+        raise SourceAuthenticationError('Source authentication is required; prior evidence retained.')
     if isinstance(value, dict) and (value.get('isError') is True
             or value.get('ok') is False or value.get('success') is False
             or value.get('error') not in (None, False, '', {}, [])):
