@@ -37,7 +37,7 @@ class Opener:
 
 class RemoteSourceTests(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {'MERCOR_API_KEY': 'mercor-sk-test-not-a-real-credential'})
+        self.env = patch.dict(os.environ, {'MERCOR_API_KEY': 'test-source-key-not-a-real-credential'})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -51,7 +51,7 @@ class RemoteSourceTests(unittest.TestCase):
         self.assertEqual(request.full_url, 'https://coil.mercor.com/tools/studio')
         self.assertEqual(request.method, 'POST')
         self.assertEqual(json.loads(request.data), args)
-        self.assertEqual(request.get_header('Authorization'), 'Bearer mercor-sk-test-not-a-real-credential')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer test-source-key-not-a-real-credential')
         self.assertEqual(request.get_header('Content-type'), 'application/json')
         self.assertEqual(opener.options[0]['timeout'], 12)
         self.assertIsNone(request.get_header('Mcp-session-id'))
