@@ -30,6 +30,7 @@ import {
   type Task,
 } from "../lib/model";
 import { isEnvelope, unlock, type Envelope } from "../lib/crypto";
+const TASKS_PER_PAGE = 50;
 const CONF: Record<string, string> = {
   confirmed: "Confirmed",
   at_risk: "At risk",
@@ -361,9 +362,12 @@ export default function Home() {
     [base, confirm, filter, now, sort],
   );
   const ordered = ascending ? filtered : [...filtered].reverse();
-  const pages = Math.max(1, Math.ceil(filtered.length / 40)),
+  const pages = Math.max(1, Math.ceil(filtered.length / TASKS_PER_PAGE)),
     currentPage = Math.min(page, pages),
-    visible = ordered.slice((currentPage - 1) * 40, currentPage * 40);
+    visible = ordered.slice(
+      (currentPage - 1) * TASKS_PER_PAGE,
+      currentPage * TASKS_PER_PAGE,
+    );
   const pick = (setter: (x: string) => void, v: string) => {
     setter(v);
     setPage(1);
@@ -1069,7 +1073,7 @@ export default function Home() {
             <div className="pagination">
               <span>
                 {filtered.length
-                  ? `${(currentPage - 1) * 40 + 1}–${Math.min(currentPage * 40, filtered.length)} of ${filtered.length}`
+                  ? `${(currentPage - 1) * TASKS_PER_PAGE + 1}–${Math.min(currentPage * TASKS_PER_PAGE, filtered.length)} of ${filtered.length}`
                   : "0 tasks"}
               </span>
               <div>
