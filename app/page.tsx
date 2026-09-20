@@ -21,7 +21,6 @@ import {
   isStale,
   moduleHours,
   overdue,
-  priority,
   safeUrl,
   signal,
   threshold,
@@ -30,15 +29,61 @@ import {
   type Task,
 } from "../lib/model";
 import { isEnvelope, unlock, type Envelope } from "../lib/crypto";
+import {
+  CONFIRMATIONS as CONF,
+  compareModules,
+  compareTasks,
+  type ModuleSortKey,
+  type TaskSortKey,
+} from "../lib/sort";
 const TASKS_PER_PAGE = 50;
-const CONF: Record<string, string> = {
-  confirmed: "Confirmed",
-  at_risk: "At risk",
-  replied: "Replied",
-  awaiting: "Awaiting reply",
-  no_request: "No request",
-  not_checked: "Not checked",
+type SortOption<K> = {
+  key: K;
+  label: string;
+  display?: React.ReactNode;
+  reverse?: boolean;
 };
+function SortHeader<K extends string | number>({
+  options,
+  sortKey,
+  ascending,
+  onSort,
+}: {
+  options: SortOption<K>[];
+  sortKey: K;
+  ascending: boolean;
+  onSort: (key: K, reverse?: boolean) => void;
+}) {
+  const active = options.find((option) => option.key === sortKey);
+  const direction = active?.reverse ? !ascending : ascending;
+  return (
+    <th scope="col" aria-sort={active ? (direction ? "ascending" : "descending") : undefined}>
+      <span className="sort-controls">
+        {options.map((option, i) => {
+          const selected = option.key === sortKey;
+          return (
+            <Fragment key={option.key}>
+              {i > 0 && <span aria-hidden="true"> / </span>}
+              <button
+                type="button"
+                className="sort-header"
+                aria-label={`Sort by ${option.label}${selected ? `, currently ${direction ? "ascending" : "descending"}` : ""}`}
+                data-active={selected}
+                title={`${option.label}: sort ${selected && direction ? "descending" : "ascending"}`}
+                onClick={() => onSort(option.key, option.reverse)}
+              >
+                <span>{option.display || option.label}</span>
+                <span className="sort-arrow" aria-hidden="true">
+                  {selected ? (direction ? "↑" : "↓") : "↕"}
+                </span>
+              </button>
+            </Fragment>
+          );
+        })}
+      </span>
+    </th>
+  );
+}
 type Notes = Record<string, { note: string; at: string }>;
 function loadNotes(): Notes {
   if(typeof window === "undefined") return {};
@@ -125,7 +170,7 @@ export default function Home() {
     [filter, setFilter] = useState("all"),
     [confirm, setConfirm] = useState("all"),
     [search, setSearch] = useState(""),
-    [sort, setSort] = useState("priority"),
+    [sort, setSort] = useState<TaskSortKey>("priority"),
     [ascending, setAscending] = useState(true),
     [page, setPage] = useState(1),
     [selected, setSelected] = useState<string | null>(null),
@@ -139,6 +184,8 @@ export default function Home() {
     [password, setPassword] = useState(""),
     [percent, setPercent] = useState(loadPercent),
     [moduleSearch, setModuleSearch] = useState(""),
+    [moduleSort, setModuleSort] = useState<ModuleSortKey>("window"),
+    [moduleAscending, setModuleAscending] = useState(false),
     [failuresOnly, setFailuresOnly] = useState(false),
     [expanded, setExpanded] = useState<Set<string>>(new Set()),
     [from, setFrom] = useState(0),
@@ -336,35 +383,12 @@ export default function Home() {
                 !isParked(t)) ||
               (filter === "active" && !isReady(t) && !isParked(t))),
         )
-        .sort((a, b) =>
-          sort === "priority"
-            ? priority(b, now) - priority(a, now) ||
-              a.name.localeCompare(b.name)
-            : sort === "updated"
-              ? (Date.parse(a.updated_at || "") || Infinity) -
-                (Date.parse(b.updated_at || "") || Infinity)
-              : sort === "due"
-                ? (Date.parse(a.deadline?.at || "") || Infinity) -
-                  (Date.parse(b.deadline?.at || "") || Infinity)
-                : sort === "moved"
-                  ? (Date.parse(a.transitioned_at || "") || Infinity) -
-                    (Date.parse(b.transitioned_at || "") || Infinity)
-                  : sort === "confirmation"
-                    ? (a.confirmation?.state || "not_checked").localeCompare(
-                        b.confirmation?.state || "not_checked",
-                      )
-                    : (
-                        a[sort as "name" | "owner" | "stage"] || ""
-                      ).localeCompare(
-                        b[sort as "name" | "owner" | "stage"] || "",
-                      ),
-        ),
-    [base, confirm, filter, now, sort],
+        .sort((a, b) => compareTasks(a, b, sort, ascending, now)),
+    [base, confirm, filter, now, sort, ascending],
   );
-  const ordered = ascending ? filtered : [...filtered].reverse();
   const pages = Math.max(1, Math.ceil(filtered.length / TASKS_PER_PAGE)),
     currentPage = Math.min(page, pages),
-    visible = ordered.slice(
+    visible = filtered.slice(
       (currentPage - 1) * TASKS_PER_PAGE,
       currentPage * TASKS_PER_PAGE,
     );
@@ -372,6 +396,14 @@ export default function Home() {
     setter(v);
     setPage(1);
   };
+  const sortTasks = (key: TaskSortKey, reverse = false) => {
+    setAscending(sort === key ? !ascending : !reverse);
+    setSort(key);
+    setPage(1);
+  };
+  const taskHeader = (options: SortOption<TaskSortKey>[]) => (
+    <SortHeader options={options} sortKey={sort} ascending={ascending} onSort={sortTasks} />
+  );
   const summary = {
     rfd: base.filter((t) => t.rfd).length,
     delivered: base.filter((t) => t.stage === "Delivered").length,
@@ -444,16 +476,23 @@ export default function Home() {
     start = Math.min(from, end),
     range = hours.slice(start, end + 1),
     sum = (a: number[]) => a.slice(start, end + 1).reduce((x, y) => x + y, 0);
+  const visibleModuleSort = typeof moduleSort === "number" && (moduleSort < start || moduleSort > end)
+    ? "window" : moduleSort;
+  const sortModules = (key: ModuleSortKey) => {
+    setModuleAscending(visibleModuleSort === key ? !moduleAscending : true);
+    setModuleSort(key);
+  };
   const modules = (moduleData?.modules || [])
     .filter(
       (m) =>
         m.name.toLowerCase().includes(moduleSearch.toLowerCase()) &&
         (!failuresOnly || sum(m.f) > 0),
     )
-    .sort((a, b) => (sum(b.f) / sum(b.d) || 0) - (sum(a.f) / sum(a.d) || 0));
+    .sort((a, b) => compareModules(a, b, visibleModuleSort, moduleAscending, start, end));
   const totalF = modules.reduce((n, m) => n + sum(m.f), 0),
     totalD = modules.reduce((n, m) => n + sum(m.d), 0),
-    worst = modules.filter((m) => sum(m.d) >= 10)[0];
+    worst = modules.filter((m) => sum(m.d) >= 10)
+      .sort((a, b) => compareModules(a, b, "window", false, start, end))[0];
   const previous = data?.history.at(
       data.history.at(-1)?.at === data.sources.tasks.at ? -2 : -1,
     ),
@@ -878,17 +917,25 @@ export default function Home() {
                 Sort by
                 <select
                   value={sort}
-                  onChange={(e) => pick(setSort, e.target.value)}
+                  onChange={(e) => {
+                    setSort(e.target.value as TaskSortKey);
+                    setAscending(true);
+                    setPage(1);
+                  }}
                 >
                   {Object.entries({
                     priority: "Triage priority",
                     name: "Task name",
+                    domain: "Domain",
                     stage: "Stage",
                     owner: "Holder",
                     updated: "Oldest update",
                     moved: "Longest in stage",
                     due: "Earliest deadline",
                     confirmation: "Confirmation",
+                    slack: "Oldest Slack activity",
+                    last_actor: "Last actor",
+                    signal: "Signal",
                   }).map(([k, v]) => (
                     <option key={k} value={k}>
                       {v}
@@ -898,7 +945,10 @@ export default function Home() {
               </label>
               <button
                 className="button"
-                onClick={() => setAscending((v) => !v)}
+                onClick={() => {
+                  setAscending((v) => !v);
+                  setPage(1);
+                }}
                 aria-label="Reverse sort order"
               >
                 {ascending ? "↑ Default" : "↓ Reverse"}
@@ -938,23 +988,23 @@ export default function Home() {
               <table className="task-table">
                 <thead>
                   <tr>
-                    <th>Task / domain</th>
-                    <th>Stage / holder</th>
+                    {taskHeader([{ key: "name", label: "Task" }, { key: "domain", label: "domain" }])}
+                    {taskHeader([{ key: "stage", label: "Stage" }, { key: "owner", label: "holder" }])}
                     {view === "completion" ? (
                       <>
-                        <th>Deadline</th>
-                        <th>Confirmation</th>
-                        <th>Last stage move</th>
+                        {taskHeader([{ key: "due", label: "Deadline" }])}
+                        {taskHeader([{ key: "confirmation", label: "Confirmation" }])}
+                        {taskHeader([{ key: "moved", label: "Last stage move" }])}
                       </>
                     ) : (
                       <>
-                        <th>Since update / in stage</th>
-                        <th>Deadline / Slack activity</th>
-                        <th>Last actor</th>
+                        {taskHeader([{ key: "updated", label: "Since update", reverse: true }, { key: "moved", label: "in stage", reverse: true }])}
+                        {taskHeader([{ key: "due", label: "Deadline" }, { key: "slack", label: "Slack activity" }])}
+                        {taskHeader([{ key: "last_actor", label: "Last actor" }])}
                       </>
                     )}
-                    <th>Signal</th>
-                    <th>Open</th>
+                    {taskHeader([{ key: "signal", label: "Signal" }])}
+                    <th scope="col">Open</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1411,13 +1461,17 @@ export default function Home() {
               <table className="heatmap">
                 <thead>
                   <tr>
-                    <th>Module / dimension</th>
-                    <th>Window</th>
+                    <SortHeader options={[{ key: "name", label: "Module / dimension" }]}
+                      sortKey={visibleModuleSort} ascending={moduleAscending} onSort={sortModules} />
+                    <SortHeader options={[{ key: "window", label: "Window" }]}
+                      sortKey={visibleModuleSort} ascending={moduleAscending} onSort={sortModules} />
                     {range.map((h, i) => (
-                      <th key={i}>
-                        <small>{h.split(" ").slice(0, 2).join(" ")}</small>
-                        {h.split(" ").slice(2).join(" ")}
-                      </th>
+                      <SortHeader key={start + i}
+                        options={[{ key: start + i, label: h, display: <>
+                          <small>{h.split(" ").slice(0, 2).join(" ")}</small>
+                          {h.split(" ").slice(2).join(" ")}
+                        </> }]}
+                        sortKey={visibleModuleSort} ascending={moduleAscending} onSort={sortModules} />
                     ))}
                   </tr>
                 </thead>

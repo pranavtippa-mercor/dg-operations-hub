@@ -9,6 +9,8 @@ One GitHub Pages application for task completion, staleness triage, and hourly m
 - **Module health:** hourly execution failure grid, dimension drilldowns, percentages/fractions, time/module filters, and CSV export.
 - **Data & refresh:** independent source dates, snapshot import/export, and refresh mode.
 
+Click a task or module column heading to sort, then click again to reverse it. Each field in a combined task heading sorts separately. Arrows show the active direction; missing dates and unobserved module rates stay last. Task sorting applies before pagination and also sets CSV order. Module rates use the selected time window or hour, with dimensions kept under their module.
+
 Studio links open the authoritative record. Local notes and follow-up drafts never send messages or mutate Studio. A page refresh cannot certify client acceptance.
 
 ## Data protection
