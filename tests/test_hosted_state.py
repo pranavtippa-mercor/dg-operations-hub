@@ -241,7 +241,7 @@ class BranchTests(unittest.TestCase):
         self.head_reads = 0
         self.race = False
 
-    def api(self, path, method='GET', body=None, missing=False):
+    def api(self, path, method='GET', body=None, missing=False, before_retry=None):
         self.calls.append((path, method, body))
         if path == '/git/ref/heads/' + state.BRANCH:
             self.head_reads += 1

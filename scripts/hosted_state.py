@@ -20,7 +20,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +40,9 @@ MAX_TOTAL_BYTES = 64 * MIB
 MAX_MANIFEST_BYTES = 96 * MIB
 MAX_ENCRYPTED_BYTES = 48 * MIB
 MAX_ARCHIVE_BYTES = 128 * MIB
+API_ATTEMPTS = 4
+API_TIMEOUT = 60
+API_WAIT_BUDGET = 120
 CHUNK_RE = re.compile(r'chunks/[0-9a-f]{64}\.enc\.json\Z')
 FIXED_PATHS = frozenset((
     'config.json', 'task-state.json', 'history.json', 'snapshot.json', 'collector-status.json',
@@ -73,22 +78,117 @@ def _valid_sha(value):
     return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value) is not None
 
 
-def api(path, method='GET', body=None, missing=False):
+def _operation(path, method):
+    # Only fixed labels reach public logs, never paths, request/response bodies or stderr.
+    for route, verb, label in (
+        (r'/git/ref/heads/collector-state', 'GET', 'read_ref'),
+        (r'/git/commits/[0-9a-f]{40}', 'GET', 'read_commit'),
+        (r'/git/trees/[0-9a-f]{40}\?recursive=1', 'GET', 'read_tree'),
+        (r'/git/blobs/[0-9a-f]{40}', 'GET', 'read_blob'),
+        (r'/git/trees', 'POST', 'create_tree'),
+        (r'/git/commits', 'POST', 'create_commit'),
+        (r'/git/refs', 'POST', 'create_ref'),
+        (r'/git/refs/heads/collector-state', 'PATCH', 'update_ref'),
+    ):
+        if method == verb and re.fullmatch(route, path):
+            return label
+    return 'other_request'
+
+
+def _response(stdout, stderr):
+    status, headers, payload = None, {}, stdout
+    parts = re.split(r'\r?\n\r?\n', stdout, maxsplit=1)
+    match = re.match(r'HTTP/\S+ ([1-5][0-9]{2})\b', parts[0])
+    if match and len(parts) == 2:
+        status, payload = int(match[1]), parts[1]
+        for line in parts[0].splitlines()[1:]:
+            key, separator, value = line.partition(':')
+            if separator:
+                headers[key.lower().strip()] = value.strip()
+    if status is None:
+        match = re.search(r'\(HTTP ([1-5][0-9]{2})\)', stderr)
+        status = int(match[1]) if match else None
+    return status, headers, payload
+
+
+def _retry_delay(status, headers, payload, stderr, attempt):
+    rate_limited = status == 429 or (status == 403 and (
+        headers.get('x-ratelimit-remaining') == '0' or 'retry-after' in headers
+        or re.search(r'(rate limit|secondary limit|abuse detection)', payload + stderr, re.I)))
+    delay = 2 ** attempt
+    if rate_limited:
+        delay = 60 * 2 ** (attempt - 1)
+    if status in (408, 429) or (status is not None and status >= 500) or rate_limited:
+        retry_after = headers.get('retry-after', '')
+        if re.fullmatch(r'[0-9]{1,10}', retry_after):
+            delay = max(delay, int(retry_after))
+        elif retry_after:
+            try:
+                delay = max(delay, int(parsedate_to_datetime(retry_after).timestamp() - time.time()) + 1)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        reset = headers.get('x-ratelimit-reset', '')
+        if headers.get('x-ratelimit-remaining') == '0' and re.fullmatch(r'[0-9]{1,12}', reset):
+            delay = max(delay, int(reset) - int(time.time()) + 1)
+        return ('rate_limit' if rate_limited else 'server_error'), delay
+    if status is None and re.search(
+            r'timeout|timed out|connection (?:reset|refused|closed)|\bEOF\b|TLS handshake|'
+            r'no such host|temporary failure|network is unreachable', stderr, re.I):
+        return 'transport_error', delay
+    return ({401: 'authentication', 403: 'permission', 404: 'not_found',
+             409: 'conflict', 422: 'validation'}.get(status, 'request_error'), None)
+
+
+def api(path, method='GET', body=None, missing=False, before_retry=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', REPO):
         raise StateError('Invalid state repository configuration.')
-    args = ['gh', 'api', 'repos/' + REPO + path, '--method', method]
+    args = ['gh', 'api', 'repos/' + REPO + path, '--method', method, '--include']
     if body is not None:
         args += ['--input', '-']
-    result = subprocess.run(args, input=json.dumps(body) if body is not None else None,
-                            capture_output=True, text=True, cwd=ROOT)
-    if result.returncode:
-        if missing and 'HTTP 404' in result.stderr:
-            return None
-        raise StateError('GitHub encrypted state request failed.')
-    try:
-        return json.loads(result.stdout) if result.stdout.strip() else None
-    except ValueError:
-        raise StateError('GitHub returned invalid state metadata.') from None
+    operation = _operation(path, method)
+    retry_safe = method == 'GET' or operation in ('create_tree', 'create_commit') or (
+        operation in ('create_ref', 'update_ref') and before_retry is not None)
+    attempts = API_ATTEMPTS if retry_safe else 1
+    waited = 0
+    request_body = json.dumps(body) if body is not None else None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1 and before_retry is not None:
+            recovered = before_retry()
+            if recovered is not None:
+                print(f'GitHub state operation={operation} reconciled after an ambiguous response.', file=sys.stderr)
+                return recovered
+        try:
+            result = subprocess.run(args, input=request_body, capture_output=True,
+                                    text=True, cwd=ROOT, timeout=API_TIMEOUT)
+            status, headers, payload = _response(result.stdout, result.stderr)
+            if not result.returncode and (status is None or 200 <= status < 300):
+                try:
+                    value = json.loads(payload) if payload.strip() else None
+                except ValueError:
+                    raise StateError(f'GitHub returned invalid state metadata (operation={operation}).') from None
+                if attempt > 1:
+                    print(f'GitHub state operation={operation} recovered on attempt={attempt}.', file=sys.stderr)
+                return value
+            if missing and method == 'GET' and status == 404:
+                return None
+            category, delay = _retry_delay(status, headers, payload, result.stderr, attempt)
+        except subprocess.TimeoutExpired:
+            status, category, delay = None, 'timeout', 2 ** attempt
+        except OSError:
+            raise StateError(f'GitHub state request could not start (operation={operation}).') from None
+        details = f'operation={operation} http={status or "unavailable"} category={category} attempt={attempt}/{attempts}'
+        if delay is None or attempt == attempts:
+            raise StateError(f'GitHub encrypted state request failed ({details}).') from None
+        if waited + delay > API_WAIT_BUDGET:
+            raise StateError(f'GitHub encrypted state request deferred ({details}; server_wait={delay}s exceeds retry budget).') from None
+        print(f'GitHub state request retry ({details}; wait={delay}s).', file=sys.stderr)
+        # Keep each sleep bounded while honoring the full server cooldown.
+        remaining = delay
+        while remaining:
+            pause = min(remaining, 60)
+            time.sleep(pause)
+            remaining -= pause
+        waited += delay
 
 
 def _head():
@@ -186,10 +286,21 @@ def _commit_tree(old_head, entries):
         raise StateError('GitHub returned an invalid state commit.')
     if _head() != old_head:
         raise StateError('State branch changed concurrently; prior state retained.')
+
+    def reconcile_ref():
+        current = _head()
+        if current == commit['sha']:
+            return {'object': {'sha': current}}
+        if current != old_head:
+            raise StateError('State branch changed during retry; refusing to overwrite newer state.')
+        return None
+
     if old_head is None:
-        api('/git/refs', 'POST', {'ref': 'refs/heads/' + BRANCH, 'sha': commit['sha']})
+        api('/git/refs', 'POST', {'ref': 'refs/heads/' + BRANCH, 'sha': commit['sha']},
+            before_retry=reconcile_ref)
     else:
-        api('/git/refs/heads/' + BRANCH, 'PATCH', {'sha': commit['sha'], 'force': True})
+        api('/git/refs/heads/' + BRANCH, 'PATCH', {'sha': commit['sha'], 'force': True},
+            before_retry=reconcile_ref)
     return commit['sha']
 
 
