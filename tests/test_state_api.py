@@ -224,6 +224,8 @@ class StateApiTests(PatchedTestCase):
         self.assertEqual(diagnostic['tree_entries'], 2)
         self.assertEqual(diagnostic['content_entries'], 1)
         self.assertEqual(diagnostic['sha_entries'], 1)
+        self.assertFalse(diagnostic['base_tree'])
+        self.assertEqual(diagnostic['deleted_entries'], 0)
         self.assertEqual(diagnostic['content_bytes'], len(SECRET))
         self.assertEqual(diagnostic['message_category'], 'validation_failed')
         self.assertEqual(diagnostic['errors'][0], {
@@ -283,6 +285,16 @@ class StateApiTests(PatchedTestCase):
         self.request.side_effect = [response(502, {'message': SECRET}), response(201, {'sha': 'a' * 40})]
         self.assertEqual(state.api('/git/trees', 'POST', {'tree': []}), {'sha': 'a' * 40})
         self.save_diagnostic.assert_not_called()
+
+    def test_incremental_request_metrics_distinguish_base_and_deletions(self):
+        body = {'base_tree': 'a' * 40, 'tree': [
+            {'path': SECRET, 'sha': None}, {'path': SECRET, 'content': SECRET}]}
+        metrics = state._request_metrics(body, json.dumps(body))
+        self.assertTrue(metrics['base_tree'])
+        self.assertEqual(metrics['tree_entries'], 2)
+        self.assertEqual(metrics['deleted_entries'], 1)
+        self.assertEqual(metrics['content_entries'], 1)
+        self.assertNotIn(SECRET, json.dumps(metrics))
 
 
 class EncryptedDiagnosticTests(PatchedTestCase):
@@ -349,6 +361,7 @@ class ReferenceRetryTests(PatchedTestCase):
         self.new = 'b' * 40
         self.tree = 'c' * 40
         self.other = 'd' * 40
+        self.base = 'e' * 40
 
     def configure(self, old, retry_head, *, repeat=False):
         self.request.reset_mock()
@@ -363,6 +376,9 @@ class ReferenceRetryTests(PatchedTestCase):
             (*write, subprocess.TimeoutExpired(['gh', SECRET], 60, stderr=SECRET)),
             ('GET', REF_PATH, head_response(retry_head)),
         ]
+        if old is not None:
+            self.steps.insert(0, ('GET', '/git/commits/' + old, response(200, {
+                'message': state.MARKER + ' Existing state', 'parents': [], 'tree': {'sha': self.base}})))
         if repeat:
             self.steps.append((*write, response(200 if old else 201, {'object': {'sha': self.new}})))
 
@@ -370,6 +386,12 @@ class ReferenceRetryTests(PatchedTestCase):
             method, path, result = self.steps.pop(0)
             self.assertEqual(args[2], prefix + path)
             self.assertEqual(args[args.index('--method') + 1], method)
+            if path == '/git/trees' and method == 'POST':
+                body = json.loads(kwargs['input'])
+                if old is None:
+                    self.assertNotIn('base_tree', body)
+                else:
+                    self.assertEqual(body['base_tree'], self.base)
             self.events.append((method, path))
             if isinstance(result, BaseException):
                 raise result

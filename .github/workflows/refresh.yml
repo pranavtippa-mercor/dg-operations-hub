@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: operations-data-refresh
@@ -47,6 +48,8 @@ jobs:
         with:
           node-version: 22
       - name: Check required connections
+        id: connections
+        continue-on-error: ${{ vars.DG_HUB_HOSTED_ENABLED == 'true' && inputs.verify_state_only != true && inputs.probe_studio_only != true }}
         env:
           VERIFY_STATE_ONLY: ${{ inputs.verify_state_only == true && 'true' || 'false' }}
         run: |
@@ -62,13 +65,16 @@ jobs:
           PY
       - name: Restore encrypted collector state
         id: restore
+        if: steps.connections.outcome == 'success'
+        continue-on-error: ${{ vars.DG_HUB_HOSTED_ENABLED == 'true' && inputs.verify_state_only != true && inputs.probe_studio_only != true }}
         run: python3 scripts/hosted_state.py restore
       - name: Inspect Studio response structure
-        if: inputs.probe_studio_only == true
+        if: steps.restore.outcome == 'success' && inputs.probe_studio_only == true
         run: python3 scripts/probe_studio.py
       - name: Collect and publish encrypted dashboard
         id: collect
-        if: inputs.verify_state_only != true && inputs.probe_studio_only != true
+        if: steps.restore.outcome == 'success' && inputs.verify_state_only != true && inputs.probe_studio_only != true
+        continue-on-error: ${{ vars.DG_HUB_HOSTED_ENABLED == 'true' && inputs.verify_state_only != true && inputs.probe_studio_only != true }}
         env:
           REFRESH_ALL: ${{ inputs.refresh_all == true && 'true' || 'false' }}
           PUBLISH_ENABLED: ${{ vars.DG_HUB_HOSTED_ENABLED }}
@@ -82,16 +88,21 @@ jobs:
           fi
           python3 scripts/publish.py "${args[@]}"
       - name: Verify restored snapshot without source access
+        id: cached
         if: inputs.verify_state_only == true && inputs.probe_studio_only != true
         run: python3 scripts/publish.py --hosted --cached
       - name: Verify dashboard decryption
-        if: success() && inputs.probe_studio_only != true
+        id: verify
+        if: always() && inputs.probe_studio_only != true && (steps.collect.outputs.snapshot_ready == 'true' || steps.cached.outcome == 'success')
+        continue-on-error: ${{ vars.DG_HUB_HOSTED_ENABLED == 'true' && inputs.verify_state_only != true && inputs.probe_studio_only != true }}
         run: node --experimental-strip-types scripts/verify_private.mts
       - name: Save encrypted collector progress
         id: save
+        continue-on-error: ${{ vars.DG_HUB_HOSTED_ENABLED == 'true' && inputs.verify_state_only != true && inputs.probe_studio_only != true }}
         if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true
         run: python3 scripts/hosted_state.py save
       - name: Preserve encrypted failure diagnostic
+        continue-on-error: true
         if: always() && hashFiles('.private/diagnostics/github-state-error.enc.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -100,6 +111,116 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+      - name: Build safe refresh health report
+        id: report
+        if: always()
+        env:
+          PROBE_ONLY: ${{ inputs.probe_studio_only == true && 'true' || 'false' }}
+          VERIFY_ONLY: ${{ inputs.verify_state_only == true && 'true' || 'false' }}
+          PUBLISH_ENABLED: ${{ vars.DG_HUB_HOSTED_ENABLED }}
+          RESTORE_OUTCOME: ${{ steps.restore.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          SAVE_OUTCOME: ${{ steps.save.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          SNAPSHOT_READY: ${{ steps.collect.outputs.snapshot_ready }}
+          SNAPSHOT_PUBLISHED: ${{ steps.collect.outputs.snapshot_published }}
+        run: python3 scripts/refresh_report.py
+      - name: Evaluate persistent refresh problems
+        id: health
+        if: always()
+        run: python3 scripts/refresh_health.py --report .private/refresh-health-report.json
+      - name: 'Health v1: evaluation recorded'
+        if: always() && steps.health.outputs.eligible == 'true'
+        run: echo 'Safe health evaluation recorded.'
+      - name: 'Health v1: checkpoint observed'
+        if: always() && steps.health.outputs.observed_checkpoint == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: checkpoint impaired'
+        if: always() && steps.health.outputs.active_checkpoint == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: checkpoint acknowledged'
+        if: always() && steps.health.outputs.acknowledged_checkpoint == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: checkpoint alerted'
+        if: always() && steps.health.outputs.alert_checkpoint == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: restore observed'
+        if: always() && steps.health.outputs.observed_restore == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: restore impaired'
+        if: always() && steps.health.outputs.active_restore == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: restore acknowledged'
+        if: always() && steps.health.outputs.acknowledged_restore == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: restore alerted'
+        if: always() && steps.health.outputs.alert_restore == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: publication observed'
+        if: always() && steps.health.outputs.observed_publication == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: publication impaired'
+        if: always() && steps.health.outputs.active_publication == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: publication acknowledged'
+        if: always() && steps.health.outputs.acknowledged_publication == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: publication alerted'
+        if: always() && steps.health.outputs.alert_publication == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_tasks observed'
+        if: always() && steps.health.outputs.observed_source_tasks == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: source_tasks impaired'
+        if: always() && steps.health.outputs.active_source_tasks == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_tasks acknowledged'
+        if: always() && steps.health.outputs.acknowledged_source_tasks == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_tasks alerted'
+        if: always() && steps.health.outputs.alert_source_tasks == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_slack observed'
+        if: always() && steps.health.outputs.observed_source_slack == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: source_slack impaired'
+        if: always() && steps.health.outputs.active_source_slack == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_slack acknowledged'
+        if: always() && steps.health.outputs.acknowledged_source_slack == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_slack alerted'
+        if: always() && steps.health.outputs.alert_source_slack == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_modules observed'
+        if: always() && steps.health.outputs.observed_source_modules == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: source_modules impaired'
+        if: always() && steps.health.outputs.active_source_modules == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_modules acknowledged'
+        if: always() && steps.health.outputs.acknowledged_source_modules == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: source_modules alerted'
+        if: always() && steps.health.outputs.alert_source_modules == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: integrity observed'
+        if: always() && steps.health.outputs.observed_integrity == 'true'
+        run: echo 'Health check observation recorded.'
+      - name: 'Health v1: integrity impaired'
+        if: always() && steps.health.outputs.active_integrity == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: integrity acknowledged'
+        if: always() && steps.health.outputs.acknowledged_integrity == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: integrity alerted'
+        if: always() && steps.health.outputs.alert_integrity == 'true'
+        run: echo 'Health status recorded.'
+      - name: 'Health v1: notify'
+        if: always() && (steps.health.outputs.notify == 'true' || steps.health.outcome != 'success')
+        run: |
+          echo '::error::A persistent refresh problem or health-monitor failure needs attention. See the job summary.'
+          exit 1
       - name: Clear private runner files
         if: always()
         run: rm -rf -- .private

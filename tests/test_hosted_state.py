@@ -202,7 +202,7 @@ class ManifestTests(unittest.TestCase):
                 download.assert_called_once_with('b' * 40)
             self.assertEqual((target / 'task-state.json').read_text(), '{"rows":[1]}')
 
-    def test_unchanged_chunks_reuse_blob_sha_and_identical_save_is_noop(self):
+    def test_unchanged_chunks_are_inherited_and_identical_save_is_noop(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'DG_HUB_STATE_KEY': TEST_KEY}):
             source = Path(directory) / 'source'
             self.fixture(source)
@@ -223,7 +223,7 @@ class ManifestTests(unittest.TestCase):
             self.assertNotEqual(entries[changed]['content'], content[changed])
             self.assertEqual(sum('content' in item for item in entries.values()), 2)
             for name in blobs.keys() - {state.STATE_FILE, changed}:
-                self.assertEqual(entries[name]['sha'], blobs[name])
+                self.assertNotIn(name, entries)
 
 
 class BranchTests(unittest.TestCase):
@@ -240,6 +240,7 @@ class BranchTests(unittest.TestCase):
                          'sha': self.blob, 'size': 512}]
         self.head_reads = 0
         self.race = False
+        self.applied_blobs = None
 
     def api(self, path, method='GET', body=None, missing=False, before_retry=None):
         self.calls.append((path, method, body))
@@ -252,6 +253,15 @@ class BranchTests(unittest.TestCase):
         if path == '/git/trees/' + self.tree + '?recursive=1':
             return {'tree': self.entries, 'truncated': False}
         if path == '/git/trees' and method == 'POST':
+            self.assertEqual(body.get('base_tree'), self.tree)
+            self.applied_blobs = {entry['path']: entry['sha'] for entry in self.entries}
+            for entry in body['tree']:
+                if 'content' in entry:
+                    self.applied_blobs[entry['path']] = blob_sha(entry['content'].encode())
+                elif entry['sha'] is None:
+                    del self.applied_blobs[entry['path']]
+                else:
+                    self.applied_blobs[entry['path']] = entry['sha']
             return {'sha': self.new_tree}
         if path == '/git/commits' and method == 'POST':
             return {'sha': self.new_commit}
@@ -267,13 +277,76 @@ class BranchTests(unittest.TestCase):
             self.assertEqual(state.update_files({state.STATE_FILE: envelope()}), self.new_commit)
         tree = next(body for path, method, body in self.calls if path == '/git/trees' and method == 'POST')
         by_name = {entry['path']: entry for entry in tree['tree']}
-        self.assertEqual(set(by_name), {state.STATE_FILE, state.AUTH_FILE})
-        self.assertEqual(by_name[state.AUTH_FILE]['sha'], self.blob)
-        self.assertNotIn('content', by_name[state.AUTH_FILE])
+        self.assertEqual(tree['base_tree'], self.tree)
+        self.assertEqual(set(by_name), {state.STATE_FILE})
+        self.assertEqual(self.applied_blobs[state.AUTH_FILE], self.blob)
+        self.assertEqual(self.applied_blobs[state.STATE_FILE], blob_sha(envelope().encode()))
         commit = next(body for path, method, body in self.calls if path == '/git/commits')
         self.assertEqual(commit['parents'], [])
         self.assertEqual(self.calls[-2][0], '/git/ref/heads/' + state.BRANCH)
         self.assertEqual(self.calls[-1][2], {'sha': self.new_commit, 'force': True})
+
+    def test_delta_removes_retired_chunks_and_preserves_kept_chunks_and_auth(self):
+        keep_chunk = 'chunks/' + '1' * 64 + '.enc.json'
+        retire_chunk = 'chunks/' + '2' * 64 + '.enc.json'
+        new_chunk = 'chunks/' + '3' * 64 + '.enc.json'
+        self.entries += [{**self.entries[0], 'path': name} for name in
+                         (state.STATE_FILE, keep_chunk, retire_chunk)]
+        existing = {entry['path']: entry['sha'] for entry in self.entries}
+        updates = {state.STATE_FILE: envelope(), new_chunk: envelope('new-chunk')}
+        with patch.object(state, 'api', side_effect=self.api):
+            state._publish(self.head, existing, updates,
+                           keep={state.STATE_FILE, state.AUTH_FILE, keep_chunk, new_chunk})
+        tree = next(body for path, method, body in self.calls if path == '/git/trees' and method == 'POST')
+        by_name = {entry['path']: entry for entry in tree['tree']}
+        self.assertEqual(set(by_name), {state.STATE_FILE, new_chunk, retire_chunk})
+        self.assertIsNone(by_name[retire_chunk]['sha'])
+        self.assertNotIn('content', by_name[retire_chunk])
+        self.assertEqual(set(self.applied_blobs), {state.STATE_FILE, state.AUTH_FILE, keep_chunk, new_chunk})
+        self.assertEqual(self.applied_blobs[keep_chunk], self.blob)
+        self.assertEqual(self.applied_blobs[state.AUTH_FILE], self.blob)
+        self.assertEqual(self.applied_blobs[new_chunk], blob_sha(updates[new_chunk].encode()))
+
+    def test_auth_update_preserves_manifest_and_all_chunks_without_resending_them(self):
+        chunks = ['chunks/' + str(i) * 64 + '.enc.json' for i in (1, 2)]
+        self.entries += [{**self.entries[0], 'path': name} for name in [state.STATE_FILE] + chunks]
+        before = {entry['path']: entry['sha'] for entry in self.entries}
+        update = envelope('new-source-auth')
+        with patch.object(state, 'api', side_effect=self.api):
+            state.update_files({state.AUTH_FILE: update})
+        tree = next(body for path, method, body in self.calls if path == '/git/trees' and method == 'POST')
+        self.assertEqual([entry['path'] for entry in tree['tree']], [state.AUTH_FILE])
+        self.assertEqual(self.applied_blobs, {**before, state.AUTH_FILE: blob_sha(update.encode())})
+
+    def test_initial_state_sends_complete_tree_without_base_tree(self):
+        calls = []
+        def initial_api(path, method='GET', body=None, **kwargs):
+            calls.append((path, method, body))
+            if path == '/git/trees':
+                self.assertNotIn('base_tree', body)
+                self.assertEqual({entry['path'] for entry in body['tree']}, {state.STATE_FILE, state.AUTH_FILE})
+                return {'sha': self.new_tree}
+            if path == '/git/commits':
+                self.assertEqual(body['parents'], [])
+                return {'sha': self.new_commit}
+            if path == '/git/refs':
+                return {'object': {'sha': self.new_commit}}
+            self.fail('Unexpected initial-state API request')
+        with patch.object(state, 'api', side_effect=initial_api), patch.object(state, '_head', return_value=None):
+            state._publish(None, {}, {state.STATE_FILE: envelope(), state.AUTH_FILE: envelope('source-auth')})
+        self.assertEqual(len(calls), 3)
+
+    def test_incremental_base_requires_valid_managed_immutable_commit(self):
+        for change in ('sha', 'marker', 'parents', 'tree'):
+            with self.subTest(change=change):
+                self.setUp()
+                if change == 'marker': self.message = 'Unmanaged user data'
+                if change == 'parents': self.parents = [{'sha': 'f' * 40}]
+                if change == 'tree': self.tree = 'bad'
+                with patch.object(state, 'api', side_effect=self.api):
+                    with self.assertRaises(state.StateError):
+                        state._commit_tree('bad' if change == 'sha' else self.head, [])
+                self.assertFalse(any(method != 'GET' for _, method, _ in self.calls))
 
     def test_fetches_ciphertext_and_allows_missing_sibling(self):
         with patch.object(state, 'api', side_effect=self.api):

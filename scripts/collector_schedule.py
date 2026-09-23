@@ -100,7 +100,8 @@ class CollectorScheduler:
                 pass
         changed = self._finish_ready() or changed
         failed = [name for name in ('modules', 'slack') if self.status.get(name, {}).get('ok') is False]
-        return {'ok': not failed, 'attempted': attempted, 'failed': failed, 'changed': changed}
+        return {'ok': not failed, 'attempted': attempted, 'failed': failed,
+                'attempt_failed': [name for name in failed if name in attempted], 'changed': changed}
 
     def refresh_all(self):
         result = self.run_due(force=True)

@@ -59,6 +59,40 @@ class PublisherTests(unittest.TestCase):
   schedule=MagicMock();schedule.run_due.return_value={'ok':True}
   with patch.object(collector_schedule,'CollectorScheduler',return_value=schedule),patch.object(publisher,'publish'):
    self.assertEqual(publisher.run_once('synthetic-key',{},'config.json',False),0)
+ def test_retained_source_status_during_cooldown_is_not_a_new_run_failure(self):
+  schedule=MagicMock();schedule.run_due.return_value={'ok':False,'failed':['slack'],'attempt_failed':[]}
+  with patch.object(collector_schedule,'CollectorScheduler',return_value=schedule),patch.object(publisher,'publish') as send:
+   self.assertEqual(publisher.run_once('synthetic-key',{},'config.json',True),0)
+   send.assert_called_once()
+ def test_workflow_outputs_are_fixed_booleans_and_never_used_locally(self):
+  with tempfile.TemporaryDirectory() as folder:
+   path=Path(folder)/'output'
+   with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','GITHUB_OUTPUT':str(path)},clear=True):
+    publisher.workflow_output('snapshot_ready',True)
+    publisher.workflow_output('snapshot_published',False)
+    self.assertEqual(path.read_text(),'snapshot_ready=true\nsnapshot_published=false\n')
+    with self.assertRaises(ValueError):publisher.workflow_output('secret','synthetic-private')
+   with patch.dict(os.environ,{'GITHUB_OUTPUT':str(path)},clear=True):
+    publisher.workflow_output('snapshot_ready',False)
+   self.assertNotIn('snapshot_ready=false',path.read_text())
+ def test_prepared_snapshot_is_reported_even_when_remote_publication_fails(self):
+  with tempfile.TemporaryDirectory() as folder:
+   root=Path(folder);(root/'.private').mkdir()
+   (root/'.private/snapshot.json').write_text('{"synthetic":true}')
+   (root/'.private/snapshot.enc.json').write_text('synthetic-ciphertext')
+   output=root/'output'
+   with patch.object(publisher,'ROOT',root),patch.object(publisher,'run'),patch.dict(os.environ,{'GITHUB_ACTIONS':'true','GITHUB_OUTPUT':str(output)},clear=True),patch.object(publisher,'api',side_effect=[None,{'sha':'a'*40},RuntimeError('publication failed')]):
+    with self.assertRaises(RuntimeError):publisher.publish('synthetic-key',True,True,None)
+   self.assertEqual(output.read_text(),'snapshot_ready=true\n')
+ def test_published_flag_requires_successful_branch_update(self):
+  with tempfile.TemporaryDirectory() as folder:
+   root=Path(folder);(root/'.private').mkdir()
+   (root/'.private/snapshot.json').write_text('{"synthetic":true}')
+   (root/'.private/snapshot.enc.json').write_text('synthetic-ciphertext')
+   output=root/'output'
+   with patch.object(publisher,'ROOT',root),patch.object(publisher,'run'),patch.dict(os.environ,{'GITHUB_ACTIONS':'true','GITHUB_OUTPUT':str(output)},clear=True),patch.object(publisher,'api',side_effect=[None,{'sha':'a'*40},{'sha':'b'*40},{}]):
+    publisher.publish('synthetic-key',True,True,None)
+   self.assertEqual(output.read_text(),'snapshot_ready=true\nsnapshot_published=true\n')
  def test_due_only_rejects_resident_or_cached_modes_before_access(self):
   for flag in ('--watch','--cached'):
    with patch.object(publisher,'access_key') as key:

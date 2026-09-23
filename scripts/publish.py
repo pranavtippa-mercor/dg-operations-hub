@@ -46,6 +46,15 @@ def api(path,method='GET',body=None,missing=False):
 class SnapshotCollectionError(RuntimeError):
     pass
 
+def workflow_output(name, value):
+    """Expose only fixed publication flags to the hosted workflow."""
+    if name not in ('snapshot_ready', 'snapshot_published') or type(value) is not bool:
+        raise ValueError('Invalid workflow publication flag.')
+    destination=os.environ.get('GITHUB_OUTPUT')
+    if destination and os.environ.get('GITHUB_ACTIONS','').lower()=='true':
+        with open(destination,'a') as handle:
+            handle.write(name+'='+str(value).lower()+'\n')
+
 def publish(key,live,commit,last_hash,config_path=None):
     try:
         run([sys.executable,'scripts/collect.py']+(['--live'] if live else [])+(['--config',str(config_path)] if config_path else []))
@@ -56,6 +65,7 @@ def publish(key,live,commit,last_hash,config_path=None):
     if digest==last_hash:return digest
     env={**os.environ,'DG_HUB_ACCESS_KEY':key}
     run(['node','scripts/encrypt.mjs'],env=env)
+    workflow_output('snapshot_ready',True)
     if commit:
         # The generated data branch is separate from source: no rebuild per refresh.
         existing=api('/git/ref/heads/'+BRANCH,missing=True)
@@ -69,6 +79,7 @@ def publish(key,live,commit,last_hash,config_path=None):
         new=api('/git/commits','POST',{'message':MARKER+' Refresh encrypted dashboard data','tree':tree['sha'],'parents':[]})
         if existing:api('/git/refs/heads/'+BRANCH,'PATCH',{'sha':new['sha'],'force':True})
         else:api('/git/refs','POST',{'ref':'refs/heads/'+BRANCH,'sha':new['sha']})
+        workflow_output('snapshot_published',True)
     print('Encrypted snapshot ready.' if not commit else 'Encrypted snapshot published.',flush=True)
     return digest
 
@@ -90,7 +101,9 @@ def run_once(key, config, config_path, commit, *, force=False):
     scheduler=CollectorScheduler(config)
     try:
         receipt=scheduler.run_due(force=force)
-        failed=not receipt['ok']
+        # A retained source warning during its retry cooldown is not a new failed
+        # attempt. The hosted health gate separately checks actual source age.
+        failed=bool(receipt.get('attempt_failed',not receipt['ok']))
         try:
             publish(key,True,commit,None,config_path=config_path)
         except SnapshotCollectionError:

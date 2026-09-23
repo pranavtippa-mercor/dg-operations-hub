@@ -24,7 +24,7 @@ class ScheduleTests(unittest.TestCase):
             first=scheduler.CollectorScheduler({},runner=run,clock=lambda:1000,status_path=path)
             try:
                 result=first.run_due()
-                self.assertEqual(result,{'ok':True,'attempted':['slack'],'failed':[],'changed':True})
+                self.assertEqual(result,{'ok':True,'attempted':['slack'],'failed':[], 'attempt_failed':[], 'changed':True})
                 self.assertEqual(first.futures,{})
                 self.assertEqual(first.status['modules']['last_success_at'],'prior')
             finally:
@@ -53,6 +53,23 @@ class ScheduleTests(unittest.TestCase):
                 self.assertEqual(s.status['slack']['last_success_at'],'prior')
                 self.assertEqual(s.status['slack']['receipt'],{'ok':True})
                 self.assertEqual(s.status['slack']['next_at'],1300)
+            finally:
+                s.close()
+
+    def test_cooldown_retains_degraded_health_without_a_new_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'status.json'
+            path.write_text(json.dumps({'slack':{'ok':False,'last_success_at':'prior','next_at':1300},
+                                        'modules':{'ok':True,'next_at':2000}}))
+            s=scheduler.CollectorScheduler({},runner=lambda *_:self.fail('Cooldown source was retried'),
+                                           clock=lambda:1100,status_path=path)
+            try:
+                result=s.run_due()
+                self.assertFalse(result['ok'])
+                self.assertEqual(result['failed'],['slack'])
+                self.assertEqual(result['attempt_failed'],[])
+                self.assertEqual(result['attempted'],[])
+                self.assertEqual(s.status['slack']['last_success_at'],'prior')
             finally:
                 s.close()
 

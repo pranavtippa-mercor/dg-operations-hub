@@ -180,10 +180,13 @@ def _request_metrics(body, request_body):
     contents = [entry['content'] for entry in entries[:MAX_FILES + 4]
                 if isinstance(entry, dict) and isinstance(entry.get('content'), str)]
     sizes = [len(content.encode()) for content in contents]
-    metrics.update(tree_entries=min(len(entries), MAX_FILES + 4),
+    metrics.update(base_tree=_valid_sha(body.get('base_tree')),
+                   tree_entries=min(len(entries), MAX_FILES + 4),
                    content_entries=len(contents),
                    sha_entries=sum(isinstance(entry, dict) and 'sha' in entry
                                    for entry in entries[:MAX_FILES + 4]),
+                   deleted_entries=sum(isinstance(entry, dict) and 'sha' in entry and entry['sha'] is None
+                                       for entry in entries[:MAX_FILES + 4]),
                    content_bytes=min(sum(sizes), MAX_ARCHIVE_BYTES + 1),
                    largest_content_bytes=min(max(sizes, default=0), MAX_ENCRYPTED_BYTES + 1))
     return metrics
@@ -336,16 +339,24 @@ def _head():
     return value
 
 
+def _managed_tree(head):
+    """Resolve only an immutable, validated generated commit to its base tree."""
+    if not _valid_sha(head):
+        raise StateError('Invalid generated state commit.')
+    commit = api('/git/commits/' + head)
+    tree = commit.get('tree') if isinstance(commit, dict) else None
+    if (not isinstance(commit, dict) or not isinstance(commit.get('message'), str)
+            or not commit['message'].startswith(MARKER)
+            or commit.get('parents') != [] or not isinstance(tree, dict) or not _valid_sha(tree.get('sha'))):
+        raise StateError('State branch is unmanaged; refusing to use or overwrite it.')
+    return tree['sha']
+
+
 def _branch():
     head = _head()
     if head is None:
         return None, {}
-    commit = api('/git/commits/' + head)
-    if (not isinstance(commit, dict) or not isinstance(commit.get('message'), str)
-            or not commit['message'].startswith(MARKER)
-            or commit.get('parents') != [] or not _valid_sha(commit.get('tree', {}).get('sha'))):
-        raise StateError('State branch is unmanaged; refusing to use or overwrite it.')
-    tree = api('/git/trees/' + commit['tree']['sha'] + '?recursive=1')
+    tree = api('/git/trees/' + _managed_tree(head) + '?recursive=1')
     entries = tree.get('tree') if isinstance(tree, dict) else None
     if not isinstance(entries, list) or not entries or len(entries) > MAX_FILES + 3 or tree.get('truncated'):
         raise StateError('State branch has an invalid tree.')
@@ -412,7 +423,12 @@ def _validate_ciphertexts(updates):
 
 
 def _commit_tree(old_head, entries):
-    tree = api('/git/trees', 'POST', {'tree': sorted(entries, key=lambda e: e['path'])})
+    body = {'tree': sorted(entries, key=lambda e: e['path'])}
+    if old_head is not None:
+        body['base_tree'] = _managed_tree(old_head)
+    print('GitHub state tree update ' + json.dumps(_request_metrics(body, json.dumps(body)),
+                                                 sort_keys=True, separators=(',', ':')), file=sys.stderr)
+    tree = api('/git/trees', 'POST', body)
     if not isinstance(tree, dict) or not _valid_sha(tree.get('sha')):
         raise StateError('GitHub returned an invalid state tree.')
     commit = api('/git/commits', 'POST', {'message': MARKER + ' Refresh encrypted collector state',
@@ -441,8 +457,14 @@ def _commit_tree(old_head, entries):
 
 def _publish(old_head, existing, updates, keep=None):
     _validate_ciphertexts(updates)
-    entries = [{'path': name, 'mode': '100644', 'type': 'blob', 'sha': sha}
-               for name, sha in existing.items() if name not in updates and (keep is None or name in keep)]
+    if old_head is None and existing:
+        raise StateError('Existing state blobs require a generated base commit.')
+    # The immutable base tree already owns unchanged blobs. Resubmitting all of
+    # their nested paths made GitHub time out even on small updates. Send only
+    # changed ciphertext and explicit removals; a parentless commit still means
+    # this change does not retain previous state snapshots in branch history.
+    entries = [{'path': name, 'mode': '100644', 'type': 'blob', 'sha': None}
+               for name in existing if name not in updates and keep is not None and name not in keep]
     entries += [{'path': name, 'mode': '100644', 'type': 'blob', 'content': content}
                 for name, content in updates.items()]
     return _commit_tree(old_head, entries)
