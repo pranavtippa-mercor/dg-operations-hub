@@ -2,7 +2,9 @@
 import importlib.util
 import io
 import json
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import call, patch
@@ -44,6 +46,7 @@ class StateApiTests(PatchedTestCase):
         self.enterContext(patch.object(state.time, 'time', return_value=1000))
         self.logs = io.StringIO()
         self.enterContext(patch.object(state.sys, 'stderr', self.logs))
+        self.save_diagnostic = self.enterContext(patch.object(state, '_save_failure_diagnostic'))
 
     def test_server_error_recovers_and_request_body_is_reused(self):
         self.request.side_effect = [response(503, {'message': SECRET}, stderr=SECRET),
@@ -200,6 +203,140 @@ class StateApiTests(PatchedTestCase):
                     state.api(path, method, {'sha': 'a' * 40})
                 self.request.assert_called_once()
                 self.sleep.assert_not_called()
+
+
+    def test_validation_diagnostic_exposes_shape_and_allowlisted_provider_categories_only(self):
+        provider = {'message': 'Validation Failed ' + SECRET, 'errors': [
+            {'resource': 'Tree', 'field': 'tree', 'code': 'custom',
+             'message': 'This request took too long to process: ' + SECRET,
+             'value': SECRET},
+            {'resource': SECRET, 'field': SECRET, 'code': SECRET, 'message': SECRET},
+        ]}
+        self.request.side_effect = [response(422, provider, headers={
+            'X-GitHub-Request-Id': 'abcd:12:3456:7890:abcdef12', 'Authorization': SECRET})]
+        body = {'tree': [{'path': SECRET, 'content': SECRET}, {'path': SECRET, 'sha': 'a' * 40}]}
+        with self.assertRaisesRegex(state.StateError, 'http=422 category=validation') as raised:
+            state.api('/git/trees', 'POST', body)
+        line = next(line for line in self.logs.getvalue().splitlines() if line.startswith('GitHub state diagnostic '))
+        diagnostic = json.loads(line.removeprefix('GitHub state diagnostic '))
+        self.assertEqual(diagnostic['request_id'], 'ABCD:12:3456:7890:ABCDEF12')
+        self.assertEqual(diagnostic['request_bytes'], len(json.dumps(body).encode()))
+        self.assertEqual(diagnostic['tree_entries'], 2)
+        self.assertEqual(diagnostic['content_entries'], 1)
+        self.assertEqual(diagnostic['sha_entries'], 1)
+        self.assertEqual(diagnostic['content_bytes'], len(SECRET))
+        self.assertEqual(diagnostic['message_category'], 'validation_failed')
+        self.assertEqual(diagnostic['errors'][0], {
+            'resource': 'Tree', 'field': 'tree', 'code': 'custom', 'message_category': 'processing_timeout'})
+        self.assertEqual(diagnostic['errors'][1], {
+            'resource': 'other', 'field': 'other', 'code': 'other', 'message_category': 'other'})
+        self.assertNotIn(SECRET, self.logs.getvalue() + str(raised.exception))
+        self.save_diagnostic.assert_called_once_with(diagnostic, json.dumps(provider))
+        self.request.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_untrusted_diagnostic_fields_are_bounded_and_cannot_escape_to_logs(self):
+        provider = {'message': SECRET, 'errors': [
+            {'resource': [SECRET], 'field': {'private': SECRET}, 'code': SECRET, 'message': SECRET},
+            SECRET, {'message': SECRET},
+        ] * 100}
+        self.request.side_effect = [response(422, provider, headers={'X-GitHub-Request-Id': SECRET})]
+        with self.assertRaises(state.StateError):
+            state.api('/git/trees', 'POST', {'tree': [{'path': SECRET, 'content': SECRET}]})
+        diagnostic = self.save_diagnostic.call_args.args[0]
+        self.assertNotIn('request_id', diagnostic)
+        self.assertEqual(diagnostic['error_count'], state.DIAGNOSTIC_ERROR_LIMIT + 1)
+        self.assertLessEqual(len(diagnostic['errors']), state.DIAGNOSTIC_ERROR_LIMIT)
+        self.assertNotIn(SECRET, self.logs.getvalue())
+        self.assertLess(len(self.logs.getvalue()), 2000)
+
+    def test_invalid_or_oversized_provider_json_stays_private(self):
+        for payload in (SECRET, SECRET * 10000):
+            with self.subTest(size=len(payload)):
+                diagnostic = state._failure_diagnostic('create_tree', 422, {}, payload, {'request_bytes': 0})
+                self.assertEqual(diagnostic['message_category'], 'unavailable')
+                self.assertNotIn(SECRET, json.dumps(diagnostic))
+
+    def test_message_classifications_never_echo_provider_text(self):
+        for message, category in (
+            ('This request took too long to process: ' + SECRET, 'processing_timeout'),
+            ('The endpoint has been spammed: ' + SECRET, 'spam_detection'),
+            ('API rate limit exceeded: ' + SECRET, 'rate_limit'),
+            ('Too many tree entries: ' + SECRET, 'entry_limit'),
+            ('Tree is too large: ' + SECRET, 'size_limit'),
+            ('Both sha and content were supplied: ' + SECRET, 'conflicting_content_and_sha'),
+            ('Blob does not exist: ' + SECRET, 'missing_object'),
+            ('Invalid object sha: ' + SECRET, 'invalid_object'),
+            ('Duplicate path: ' + SECRET, 'path_conflict'),
+        ):
+            with self.subTest(category=category):
+                self.assertEqual(state._message_category(message), category)
+
+    def test_timeout_does_not_retain_an_earlier_responses_detail(self):
+        self.request.side_effect = [response(502, {'message': SECRET})] + [
+            subprocess.TimeoutExpired(['gh'], 60)] * (state.API_ATTEMPTS - 1)
+        with self.assertRaisesRegex(state.StateError, 'category=timeout'):
+            state.api('/git/trees', 'POST', {'tree': []})
+        self.save_diagnostic.assert_not_called()
+
+    def test_recovered_requests_do_not_leave_failure_artifacts(self):
+        self.request.side_effect = [response(502, {'message': SECRET}), response(201, {'sha': 'a' * 40})]
+        self.assertEqual(state.api('/git/trees', 'POST', {'tree': []}), {'sha': 'a' * 40})
+        self.save_diagnostic.assert_not_called()
+
+
+class EncryptedDiagnosticTests(PatchedTestCase):
+    def setUp(self):
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.path = Path(self.directory) / 'diagnostics/github-state-error.enc.json'
+        self.enterContext(patch.object(state, 'DIAGNOSTIC_PATH', self.path))
+        self.enterContext(patch.dict(os.environ, {
+            'DG_HUB_STATE_KEY': 'A' * 43, 'GH_TOKEN': SECRET,
+            'STUDIO_API_KEY': 'studio-private-example-key',
+        }))
+        self.logs = io.StringIO()
+        self.enterContext(patch.object(state.sys, 'stderr', self.logs))
+
+    def test_artifact_round_trip_contains_redacted_response_and_no_credentials(self):
+        payload = json.dumps({'message': 'Unknown provider reason ' + SECRET,
+                              'errors': [{'message': os.environ['STUDIO_API_KEY']}],
+                              'other': os.environ['DG_HUB_STATE_KEY']})
+        state._save_failure_diagnostic({'operation': 'create_tree', 'http': 422}, payload)
+        encrypted = self.path.read_bytes()
+        self.assertNotIn(SECRET.encode(), encrypted)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        decoded = state.crypt('decrypt', encrypted, state.DIAGNOSTIC_PURPOSE)
+        document = json.loads(decoded)
+        self.assertIn('Unknown provider reason [redacted]', document['response'])
+        for credential in (SECRET, os.environ['STUDIO_API_KEY'], os.environ['DG_HUB_STATE_KEY']):
+            self.assertNotIn(credential, decoded.decode() + self.logs.getvalue())
+        self.assertEqual(document['diagnostic'], {'operation': 'create_tree', 'http': 422})
+        self.assertFalse(document['response_truncated'])
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_redaction_happens_before_response_truncation(self):
+        payload = 'x' * (state.DIAGNOSTIC_RESPONSE_BYTES - 4) + SECRET + 'y' * 200
+        state._save_failure_diagnostic({'http': 422}, payload)
+        document = json.loads(state.crypt('decrypt', self.path.read_bytes(), state.DIAGNOSTIC_PURPOSE))
+        self.assertTrue(document['response_truncated'])
+        self.assertLessEqual(len(document['response'].encode()), state.DIAGNOSTIC_RESPONSE_BYTES)
+        self.assertNotIn(SECRET[:4], document['response'])
+
+    def test_encryption_failure_emits_only_fixed_warning_and_no_plaintext_file(self):
+        with patch.object(state, 'crypt', side_effect=RuntimeError(SECRET)):
+            state._save_failure_diagnostic({'http': 422}, SECRET)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.logs.getvalue(), 'Encrypted GitHub state diagnostic could not be retained.\n')
+
+    def test_existing_symlink_is_not_overwritten(self):
+        self.path.parent.mkdir()
+        outside = Path(self.directory) / 'outside'
+        outside.write_text('keep')
+        self.path.symlink_to(outside)
+        state._save_failure_diagnostic({'http': 422}, SECRET)
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual(outside.read_text(), 'keep')
+        self.assertIn('could not be retained', self.logs.getvalue())
 
 
 class ReferenceRetryTests(PatchedTestCase):

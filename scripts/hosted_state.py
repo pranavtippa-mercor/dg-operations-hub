@@ -43,6 +43,16 @@ MAX_ARCHIVE_BYTES = 128 * MIB
 API_ATTEMPTS = 4
 API_TIMEOUT = 60
 API_WAIT_BUDGET = 120
+DIAGNOSTIC_ERROR_LIMIT = 20
+DIAGNOSTIC_MESSAGE_LIMIT = 4096
+DIAGNOSTIC_RESPONSE_BYTES = 65536
+DIAGNOSTIC_PATH = ROOT / '.private/diagnostics/github-state-error.enc.json'
+DIAGNOSTIC_PURPOSE = 'dg-operations-github-state-diagnostic'
+DIAGNOSTIC_CODES = frozenset(('missing', 'missing_field', 'invalid', 'already_exists',
+                             'unprocessable', 'custom', 'too_large'))
+DIAGNOSTIC_RESOURCES = frozenset(('Tree', 'Blob', 'Commit', 'Reference', 'Repository'))
+DIAGNOSTIC_FIELDS = frozenset(('tree', 'base_tree', 'sha', 'path', 'mode', 'type',
+                              'content', 'encoding', 'parents', 'ref', 'force'))
 CHUNK_RE = re.compile(r'chunks/[0-9a-f]{64}\.enc\.json\Z')
 FIXED_PATHS = frozenset((
     'config.json', 'task-state.json', 'history.json', 'snapshot.json', 'collector-status.json',
@@ -139,6 +149,121 @@ def _retry_delay(status, headers, payload, stderr, attempt):
              409: 'conflict', 422: 'validation'}.get(status, 'request_error'), None)
 
 
+def _message_category(message):
+    """Classify provider text without ever returning any part of that text."""
+    if not isinstance(message, str):
+        return 'unavailable'
+    message = message[:DIAGNOSTIC_MESSAGE_LIMIT].lower()
+    for pattern, category in (
+        (r'timed? out|took too long|timeout', 'processing_timeout'),
+        (r'spam|abuse detection', 'spam_detection'),
+        (r'rate limit|secondary limit', 'rate_limit'),
+        (r'too many (?:tree )?(?:entries|objects|files)', 'entry_limit'),
+        (r'(?:tree|blob|content|payload|request)[^\n]{0,80}(?:too large|exceeds|maximum size)', 'size_limit'),
+        (r'(?:sha[^\n]{0,80}content|content[^\n]{0,80}sha)[^\n]{0,80}(?:both|same|only one)|(?:both|same)[^\n]{0,80}(?:sha[^\n]{0,80}content|content[^\n]{0,80}sha)', 'conflicting_content_and_sha'),
+        (r'(?:object|blob|tree|sha)[^\n]{0,80}(?:not found|does not exist|missing)|(?:not found|does not exist)[^\n]{0,80}(?:object|blob|tree|sha)', 'missing_object'),
+        (r'(?:invalid|not a valid)[^\n]{0,80}(?:object|blob|tree|sha)|(?:object|blob|tree|sha)[^\n]{0,80}(?:invalid|not valid)', 'invalid_object'),
+        (r'is a directory|not a directory|duplicate path', 'path_conflict'),
+        (r'validation failed', 'validation_failed'),
+    ):
+        if re.search(pattern, message):
+            return category
+    return 'other'
+
+
+def _request_metrics(body, request_body):
+    """Only bounded numeric shape information may leave the request boundary."""
+    metrics = {'request_bytes': min(len((request_body or '').encode()), MAX_ARCHIVE_BYTES + 1)}
+    entries = body.get('tree') if isinstance(body, dict) else None
+    if not isinstance(entries, list):
+        return metrics
+    contents = [entry['content'] for entry in entries[:MAX_FILES + 4]
+                if isinstance(entry, dict) and isinstance(entry.get('content'), str)]
+    sizes = [len(content.encode()) for content in contents]
+    metrics.update(tree_entries=min(len(entries), MAX_FILES + 4),
+                   content_entries=len(contents),
+                   sha_entries=sum(isinstance(entry, dict) and 'sha' in entry
+                                   for entry in entries[:MAX_FILES + 4]),
+                   content_bytes=min(sum(sizes), MAX_ARCHIVE_BYTES + 1),
+                   largest_content_bytes=min(max(sizes, default=0), MAX_ENCRYPTED_BYTES + 1))
+    return metrics
+
+
+def _failure_diagnostic(operation, status, headers, payload, request_metrics):
+    """An allowlist, not redaction, protects public Actions logs from response data."""
+    diagnostic = {'operation': operation, 'http': status, **request_metrics}
+    request_id = headers.get('x-github-request-id', '')
+    if isinstance(request_id, str) and re.fullmatch(r'[0-9A-Fa-f]{1,8}(?::[0-9A-Fa-f]{1,8}){4}', request_id):
+        diagnostic['request_id'] = request_id.upper()
+    try:
+        value = json.loads(payload) if len(payload) <= DIAGNOSTIC_RESPONSE_BYTES else None
+    except (ValueError, TypeError):
+        value = None
+    diagnostic['message_category'] = _message_category(value.get('message')) if isinstance(value, dict) else 'unavailable'
+    errors = value.get('errors') if isinstance(value, dict) else None
+    if isinstance(errors, list):
+        diagnostic['error_count'] = min(len(errors), DIAGNOSTIC_ERROR_LIMIT + 1)
+        safe_errors = []
+        for error in errors[:DIAGNOSTIC_ERROR_LIMIT]:
+            if isinstance(error, dict):
+                safe = {key: error[key] if isinstance(error.get(key), str) and error[key] in allowed else 'other'
+                        for key, allowed in (('resource', DIAGNOSTIC_RESOURCES),
+                                             ('field', DIAGNOSTIC_FIELDS), ('code', DIAGNOSTIC_CODES))}
+                safe['message_category'] = _message_category(error.get('message'))
+            else:
+                safe = {'message_category': _message_category(error)}
+            if safe not in safe_errors:
+                safe_errors.append(safe)
+        diagnostic['errors'] = safe_errors
+    return diagnostic
+
+
+def _save_failure_diagnostic(diagnostic, payload):
+    """Keep bounded provider detail as ciphertext, independently of the failing save."""
+    if not os.environ.get('DG_HUB_STATE_KEY'):
+        return
+    pending = None
+    try:
+        # Never include request content, arguments, stderr, arbitrary headers or
+        # environment data. Redact before truncating so a boundary cannot retain
+        # only the first part of a credential that the provider might echo.
+        secrets = set()
+        for name, value in os.environ.items():
+            if value and (name in ('GH_TOKEN', 'GITHUB_TOKEN', 'MERCOR_API_KEY', 'STUDIO_API_KEY')
+                          or re.search(r'(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD)$', name)):
+                secrets.add(value)
+                secrets.add(json.dumps(value)[1:-1])
+        redacted = payload
+        for value in sorted(secrets, key=len, reverse=True):
+            redacted = redacted.replace(value, '[redacted]')
+        raw = redacted.encode()
+        document = {'schema_version': 1, 'purpose': DIAGNOSTIC_PURPOSE,
+                    'observed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                    'diagnostic': diagnostic,
+                    'response': raw[:DIAGNOSTIC_RESPONSE_BYTES].decode('utf-8', errors='ignore'),
+                    'response_truncated': len(raw) > DIAGNOSTIC_RESPONSE_BYTES}
+        encrypted = crypt('encrypt', _json_bytes(document), DIAGNOSTIC_PURPOSE)
+        private = DIAGNOSTIC_PATH.parent.parent
+        _safe_path(private, 'diagnostics', directory=True)
+        DIAGNOSTIC_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _safe_path(private, 'diagnostics/github-state-error.enc.json')
+        descriptor, name = tempfile.mkstemp(prefix='.github-state-error-', dir=DIAGNOSTIC_PATH.parent)
+        pending = Path(name)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(encrypted)
+        pending.replace(DIAGNOSTIC_PATH)
+        print('Encrypted GitHub state diagnostic retained.', file=sys.stderr)
+    except Exception:
+        # Recording a diagnostic must not replace or reveal the original error.
+        print('Encrypted GitHub state diagnostic could not be retained.', file=sys.stderr)
+    finally:
+        if pending is not None:
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def api(path, method='GET', body=None, missing=False, before_retry=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', REPO):
         raise StateError('Invalid state repository configuration.')
@@ -151,7 +276,9 @@ def api(path, method='GET', body=None, missing=False, before_retry=None):
     attempts = API_ATTEMPTS if retry_safe else 1
     waited = 0
     request_body = json.dumps(body) if body is not None else None
+    request_metrics = _request_metrics(body, request_body)
     for attempt in range(1, attempts + 1):
+        headers, payload, diagnostic = {}, '', None
         if attempt > 1 and before_retry is not None:
             recovered = before_retry()
             if recovered is not None:
@@ -171,6 +298,10 @@ def api(path, method='GET', body=None, missing=False, before_retry=None):
                 return value
             if missing and method == 'GET' and status == 404:
                 return None
+            if status is not None:
+                diagnostic = _failure_diagnostic(operation, status, headers, payload, request_metrics)
+                print('GitHub state diagnostic ' + json.dumps(diagnostic, sort_keys=True, separators=(',', ':')),
+                      file=sys.stderr)
             category, delay = _retry_delay(status, headers, payload, result.stderr, attempt)
         except subprocess.TimeoutExpired:
             status, category, delay = None, 'timeout', 2 ** attempt
@@ -178,8 +309,12 @@ def api(path, method='GET', body=None, missing=False, before_retry=None):
             raise StateError(f'GitHub state request could not start (operation={operation}).') from None
         details = f'operation={operation} http={status or "unavailable"} category={category} attempt={attempt}/{attempts}'
         if delay is None or attempt == attempts:
+            if diagnostic is not None:
+                _save_failure_diagnostic(diagnostic, payload)
             raise StateError(f'GitHub encrypted state request failed ({details}).') from None
         if waited + delay > API_WAIT_BUDGET:
+            if diagnostic is not None:
+                _save_failure_diagnostic(diagnostic, payload)
             raise StateError(f'GitHub encrypted state request deferred ({details}; server_wait={delay}s exceeds retry budget).') from None
         print(f'GitHub state request retry ({details}; wait={delay}s).', file=sys.stderr)
         # Keep each sleep bounded while honoring the full server cooldown.

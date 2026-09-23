@@ -88,8 +88,18 @@ jobs:
         if: success() && inputs.probe_studio_only != true
         run: node --experimental-strip-types scripts/verify_private.mts
       - name: Save encrypted collector progress
+        id: save
         if: always() && steps.restore.outcome == 'success' && inputs.verify_state_only != true
         run: python3 scripts/hosted_state.py save
+      - name: Preserve encrypted failure diagnostic
+        if: always() && hashFiles('.private/diagnostics/github-state-error.enc.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: github-state-error-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .private/diagnostics/github-state-error.enc.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
       - name: Clear private runner files
         if: always()
         run: rm -rf -- .private
